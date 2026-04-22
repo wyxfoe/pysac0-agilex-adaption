@@ -1,0 +1,2 @@
+set(arm_control_MESSAGE_FILES "/home/lin/Documents/test/remote_control/follow_control/follow2/src/arm_control/msg/PosCmd.msg;/home/lin/Documents/test/remote_control/follow_control/follow2/src/arm_control/msg/JointControl.msg;/home/lin/Documents/test/remote_control/follow_control/follow2/src/arm_control/msg/JointInformation.msg;/home/lin/Documents/test/remote_control/follow_control/follow2/src/arm_control/msg/ChassisCtrl.msg;/home/lin/Documents/test/remote_control/follow_control/follow2/src/arm_control/msg/MagicCmd.msg")
+set(arm_control_SERVICE_FILES "")
