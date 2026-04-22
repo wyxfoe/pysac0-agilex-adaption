@@ -101,10 +101,28 @@ bash train_agilex.sh pick_place 50 0 0 ~/data
 | `--temporal_agg` | 多帧特征聚合 (`last/mean/concat`) | `concat` |
 | `--use_robot_base` | 把 `/base_action` 拼接到 qpos/action | `False` |
 | `--arm_delay_time` | 前移 action 目标帧数 (同 ACT dataloader) | `0` |
+| `--arm` | `both` (14-D) / `left` / `right` (各 7-D) | `both` |
 | `--use_amp` | AMP fp16 | `False` |
 | `--use_ema` | EMA 权重 | `False` |
 
 > **约束**：`n_obs_steps + n_action_steps <= future_action_window`。
+
+### 2.4.1 只训练右臂 (常见用例)
+
+当采集过程中左臂一直静止时（用 `inspect_hdf5.py` 会看到 `qpos[0:7]` 的 std
+全是 0），可以切到单臂模式。action_dim 变 7，推理时也只对右臂下发命令，非活动
+臂完全不发布。
+
+```bash
+python train_agilex.py \
+    --data_path ~/data/right_task \
+    --num_episodes 50 \
+    --arm right \
+    --num_cameras 3 \
+    --checkpoint_dir checkpoints/right-50
+```
+
+shell 脚本里改顶部 `arm="right"` 即可。左臂训练同理，`arm=left`。
 
 ### 2.5 Dataloader 自检
 
@@ -157,8 +175,11 @@ checkpoint 中已嵌入 `args` 与 `norm_stats`，无需额外传递。若仅有
 4. `qpos` 按训练时的 mean/std 归一化，作为 DiT `state` token。
 5. `ActionModel.sample(num_steps, ode_solver, cfg_scale)` 生成
    `(1, n_action_steps, action_dim)` 动作；反归一化后入队。
-6. 每个 tick 从队列弹出一帧，split 成 `left[:7] / right[7:14]`
-   (若开启 base 再解包 `action[14:16]`)，发布到 `/master/joint_*`。
+6. 每个 tick 从队列弹出一帧，根据 checkpoint 中的 `arm` 设置决定发布目标：
+   - `arm=both`：action[:7] → `/master/joint_left`, action[7:14] → `/master/joint_right`
+   - `arm=left`：action[:7] → `/master/joint_left` (右臂不发)
+   - `arm=right`：action[:7] → `/master/joint_right` (左臂不发)
+   若训练时开了 base，再解包 `action[base_offset:base_offset+2]` 发到 `/cmd_vel`。
 
 ### 3.3 与 ACT 推理的差异
 
@@ -197,6 +218,8 @@ pip install torch torchvision h5py numpy tqdm timm opencv-python wandb
 2. **关节顺序**
    - AgileX `puppet_arm_left.position` 为 7-D 向量；末位是夹爪。和 NemoDiT
      `[left_arm(6), left_gripper(1), ...]` 字节对齐，不需重排。
+   - 单臂模式 (`--arm left/right`) 下，action / state 都是 7-D (单臂本身)；
+     推理只发布该侧话题，非活动臂不会收到任何命令。
 3. **归一化统计**
    - 推理时必须使用训练集相同的 `qpos_mean/std` & `action_mean/std`。
      checkpoint 已内嵌，优先从 checkpoint 读；失败才回落到 `dataset_stats.pkl`。

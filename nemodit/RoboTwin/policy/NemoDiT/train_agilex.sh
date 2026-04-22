@@ -38,6 +38,7 @@ temporal_agg="concat"
 num_cameras=3                # cam_high, cam_left_wrist, cam_right_wrist
 use_robot_base=""            # set to "--use_robot_base" for mobile base tasks
 arm_delay_time=0
+arm="both"                   # both (14-D) | left (7-D) | right (7-D)
 
 epochs=500
 batch_size=32
@@ -74,6 +75,7 @@ python train_agilex.py \
     --num_cameras "${num_cameras}" \
     ${use_robot_base} \
     --arm_delay_time "${arm_delay_time}" \
+    --arm "${arm}" \
     --model_type "${model_type}" \
     --vision_backbone "${vision_backbone}" \
     --vision_pretrained \

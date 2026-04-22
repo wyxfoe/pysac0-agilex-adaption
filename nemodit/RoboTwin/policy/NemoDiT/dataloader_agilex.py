@@ -45,6 +45,38 @@ from torch.utils.data import Dataset
 
 AGILEX_CAMERA_NAMES = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
 AGILEX_STATE_DIM = 14  # left(7) + right(7), each = 6 joints + 1 gripper
+AGILEX_SINGLE_ARM_DIM = 7  # 6 joints + 1 gripper
+
+
+def _select_arm(arr: np.ndarray, arm: str) -> np.ndarray:
+    """Slice the per-arm columns from a 14-D AgileX qpos/action tensor.
+
+    ``arr`` may be 1-D ``(14,)`` or 2-D ``(T, 14)``. Anything beyond the first
+    14 columns (e.g. concatenated base_action) is preserved verbatim so the
+    slice can be combined with ``use_robot_base``.
+    """
+    if arm == "both":
+        return arr
+    if arm == "left":
+        arm_slice = slice(0, 7)
+    elif arm == "right":
+        arm_slice = slice(7, 14)
+    else:
+        raise ValueError(f"arm must be 'both', 'left' or 'right', got {arm!r}")
+
+    if arr.ndim == 1:
+        extra = arr[14:] if arr.shape[0] > 14 else arr[0:0]
+        return np.concatenate([arr[arm_slice], extra], axis=0)
+    if arr.ndim == 2:
+        extra = arr[:, 14:] if arr.shape[1] > 14 else arr[:, :0]
+        return np.concatenate([arr[:, arm_slice], extra], axis=1)
+    raise ValueError(f"Unexpected array shape {arr.shape} for _select_arm")
+
+
+def action_dim_for(arm: str, use_robot_base: bool = False) -> int:
+    """Return the action/state dimension implied by ``arm`` + ``use_robot_base``."""
+    base = AGILEX_STATE_DIM if arm == "both" else AGILEX_SINGLE_ARM_DIM
+    return base + (2 if use_robot_base else 0)
 
 
 def _decode_image(raw: np.ndarray, compressed: bool) -> np.ndarray:
@@ -92,6 +124,7 @@ def compute_agilex_norm_stats(
     num_episodes: Optional[int] = None,
     use_robot_base: bool = False,
     episode_ids: Optional[List[int]] = None,
+    arm: str = "both",
 ) -> Dict[str, np.ndarray]:
     """Compute per-dimension mean/std statistics for qpos + action.
 
@@ -106,10 +139,13 @@ def compute_agilex_norm_stats(
             mobile-base tasks. Default ``False``.
         episode_ids: Explicit list of numeric episode ids to include. Takes
             precedence over ``num_episodes`` when both are set.
+        arm: ``'both'`` (14-D, default), ``'left'`` (7-D, columns 0-6) or
+            ``'right'`` (7-D, columns 7-13). When ``'left'/'right'``, stats are
+            computed only on the selected arm's columns (+ optional base).
 
     Returns:
         Dict with keys ``qpos_mean``, ``qpos_std``, ``action_mean``,
-        ``action_std``.  Each array has shape ``(state_dim,)``.
+        ``action_std``.  Each array has shape ``(action_dim,)``.
     """
     if episode_ids is not None:
         files = _list_episode_files(data_path, episode_ids)
@@ -130,6 +166,8 @@ def compute_agilex_norm_stats(
                 base = root["/base_action"][()].astype(np.float32)
                 qpos = np.concatenate([qpos, base], axis=1)
                 action = np.concatenate([action, base], axis=1)
+        qpos = _select_arm(qpos, arm)
+        action = _select_arm(action, arm)
         all_qpos.append(qpos)
         all_action.append(action)
 
@@ -173,6 +211,10 @@ class AgileXDataset(Dataset):
             yielding 16-D state/action. Stats must be computed with the same flag.
         arm_delay_time: Forward shift for the action target in frames, matching
             ``agx_robot/aloha-devel/act/utils.py``. Default 0 (no shift).
+        arm: One of ``'both'`` (14-D dual arm, default), ``'left'`` (7-D left arm
+            only) or ``'right'`` (7-D right arm only). When a single arm is
+            chosen the DiT will run on a 7-D action/state (+2 if
+            ``use_robot_base``). Norm stats must be computed with the same ``arm``.
     """
 
     def __init__(
@@ -188,10 +230,12 @@ class AgileXDataset(Dataset):
         use_robot_base: bool = False,
         arm_delay_time: int = 0,
         episode_ids: Optional[List[int]] = None,
+        arm: str = "both",
     ):
         super().__init__()
         assert past_action_window == 0, "past_action_window must be 0 (DiT ignores history)."
         assert n_obs_steps >= 1, f"n_obs_steps must be >= 1, got {n_obs_steps}"
+        assert arm in ("both", "left", "right"), f"arm must be both/left/right, got {arm!r}"
 
         self.data_path = data_path
         self.future_action_window = future_action_window
@@ -199,6 +243,7 @@ class AgileXDataset(Dataset):
         self.n_obs_steps = n_obs_steps
         self.use_robot_base = use_robot_base
         self.arm_delay_time = arm_delay_time
+        self.arm = arm
         self.norm_stats = {k: np.asarray(v, dtype=np.float32) for k, v in norm_stats.items()}
 
         if camera_names is None:
@@ -248,6 +293,7 @@ class AgileXDataset(Dataset):
         if self.use_robot_base:
             base = f["/base_action"][()].astype(np.float32)
             actions = np.concatenate([actions, base], axis=1)  # (T, 16)
+        actions = _select_arm(actions, self.arm)  # (T, action_dim)
 
         T_total = actions.shape[0]
         # Delay shift mirrors the agx_robot ACT dataloader: when the master arm
@@ -265,7 +311,7 @@ class AgileXDataset(Dataset):
         if self.use_robot_base:
             base = f["/base_action"][timestep].astype(np.float32)  # (2,)
             qpos = np.concatenate([qpos, base], axis=0)
-        return qpos
+        return _select_arm(qpos, self.arm)
 
     def _load_frame_images(
         self, f: h5py.File, timestep: int, compressed: bool
@@ -351,9 +397,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sanity-check the AgileX dataloader.")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--num_episodes", type=int, default=None)
+    parser.add_argument("--arm", type=str, default="both", choices=["both", "left", "right"])
     args = parser.parse_args()
 
-    stats = compute_agilex_norm_stats(args.data_path, args.num_episodes)
+    stats = compute_agilex_norm_stats(
+        args.data_path, num_episodes=args.num_episodes, arm=args.arm,
+    )
+    print(f"arm={args.arm} action_dim={stats['qpos_mean'].shape[0]}")
     print("qpos_mean:", stats["qpos_mean"])
     print("qpos_std :", stats["qpos_std"])
 
@@ -363,6 +413,7 @@ if __name__ == "__main__":
         future_action_window=13,
         num_cameras=3,
         n_obs_steps=2,
+        arm=args.arm,
     )
     print(f"Dataset size: {len(dataset)}")
     sample = dataset[0]

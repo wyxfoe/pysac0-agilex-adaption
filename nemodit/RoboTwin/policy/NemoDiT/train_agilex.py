@@ -30,6 +30,7 @@ from dataloader_agilex import (
     AGILEX_CAMERA_NAMES,
     AGILEX_STATE_DIM,
     AgileXDataset,
+    action_dim_for,
     compute_agilex_norm_stats,
 )
 from model.action_model.action_model import ActionModel
@@ -53,6 +54,9 @@ def parse_args() -> argparse.Namespace:
                         help="Concatenate /base_action (2-D) onto qpos/action")
     parser.add_argument("--arm_delay_time", type=int, default=0,
                         help="Forward shift of action target in frames (default: 0)")
+    parser.add_argument("--arm", type=str, default="both",
+                        choices=["both", "left", "right"],
+                        help="Train on a single arm (7-D) or both arms (14-D, default).")
 
     # Temporal windows
     parser.add_argument("--future_action_window", type=int, default=13,
@@ -159,6 +163,7 @@ def prepare_dataloader(args: argparse.Namespace):
         args.data_path,
         use_robot_base=args.use_robot_base,
         episode_ids=episode_ids,
+        arm=args.arm,
     )
 
     dataset = AgileXDataset(
@@ -173,6 +178,7 @@ def prepare_dataloader(args: argparse.Namespace):
         use_robot_base=args.use_robot_base,
         arm_delay_time=args.arm_delay_time,
         episode_ids=episode_ids,
+        arm=args.arm,
     )
     loader = DataLoader(
         dataset,
@@ -269,11 +275,12 @@ def load_checkpoint(model, optimizer, scheduler, scaler, ema_model, path):
 def train():
     args = parse_args()
 
-    # Action dim is fully determined by the AgileX layout.
-    args.action_dim = AGILEX_STATE_DIM + (2 if args.use_robot_base else 0)
+    # Action dim is fully determined by the AgileX layout + arm selection.
+    args.action_dim = action_dim_for(args.arm, args.use_robot_base)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    print(f"action_dim={args.action_dim} (AgileX dual-arm{' + base' if args.use_robot_base else ''})")
+    arm_desc = {"both": "dual-arm", "left": "left-arm only", "right": "right-arm only"}[args.arm]
+    print(f"action_dim={args.action_dim} (AgileX {arm_desc}{' + base' if args.use_robot_base else ''})")
     print(f"n_obs_steps={args.n_obs_steps} n_action_steps={args.n_action_steps} "
           f"future_action_window={args.future_action_window} temporal_agg={args.temporal_agg}")
 
