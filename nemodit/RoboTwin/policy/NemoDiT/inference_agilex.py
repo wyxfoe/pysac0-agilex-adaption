@@ -1,0 +1,477 @@
+"""Real-robot inference for NemoDiT on AgileX (松灵) / Mobile-Aloha hardware.
+
+This script mirrors the topology of ``agx_robot/aloha-devel/act/inference.py``
+(ROS-based master/puppet arms + 3 RealSense cameras) but replaces the ACT
+policy with a trained ``ActionModel`` (Flow-Matching DiT). It reads a
+checkpoint produced by ``train_agilex.py`` — which embeds both the training
+hyper-parameters and the qpos/action normalization stats — so that the same
+file is sufficient for deployment.
+
+Topology of a control tick:
+  1. ROS callbacks buffer camera frames + joint states.
+  2. ``get_frame()`` returns time-synchronized sensor data.
+  3. The observation is pushed into a fixed-length ``deque`` of length
+     ``n_obs_steps``; on the first tick the deque is filled by duplication.
+  4. The current slave qpos is normalized and used as the DiT ``state`` token.
+  5. ``model.sample(...)`` returns ``(1, n_action_steps, action_dim)`` normalized
+     actions; we denormalize and publish them one per tick at ``publish_rate``.
+  6. When the execution queue drains, the cycle repeats with fresh observations.
+
+Usage::
+
+    python inference_agilex.py \
+        --checkpoint checkpoints/agilex-run/final.pt \
+        --publish_rate 40
+
+Checkpoint requirements:
+    ``torch.load(checkpoint)`` must yield a dict that contains
+    ``model_state_dict``, ``args`` (from ``train_agilex.py``), and either
+    ``norm_stats`` or a sibling ``dataset_stats.pkl`` file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pickle
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from typing import Deque, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+
+# ROS imports are kept optional so the file can be imported on a workstation
+# without a ROS install (e.g. just for static analysis / tests).
+try:  # pragma: no cover - only available on the robot PC
+    import rospy
+    from cv_bridge import CvBridge
+    from geometry_msgs.msg import Twist
+    from nav_msgs.msg import Odometry
+    from sensor_msgs.msg import Image, JointState
+    from std_msgs.msg import Header
+    _ROS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _ROS_AVAILABLE = False
+
+from dataloader_agilex import AGILEX_CAMERA_NAMES, AGILEX_STATE_DIM
+from model.action_model.action_model import ActionModel
+
+
+# ------------------------------------------------------------------ #
+# Policy wrapper
+# ------------------------------------------------------------------ #
+
+
+class AgileXPolicy:
+    """Thin wrapper around ``ActionModel`` that handles normalization + queueing."""
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cuda:0",
+        num_inference_steps: Optional[int] = None,
+        ode_solver: str = "midpoint",
+        cfg_scale: float = 1.0,
+        stats_path: Optional[str] = None,
+    ):
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+        print(f"[AgileXPolicy] Loading checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        train_args = ckpt.get("args", {})
+        if not train_args:
+            raise ValueError(
+                "Checkpoint does not contain training args; cannot rebuild the model."
+            )
+
+        self.n_obs_steps = int(train_args.get("n_obs_steps", 2))
+        self.n_action_steps = int(train_args.get("n_action_steps", 8))
+        self.num_cameras = int(train_args.get("num_cameras", 3))
+        self.camera_names = train_args.get("camera_names") or AGILEX_CAMERA_NAMES
+        self.camera_names = list(self.camera_names[: self.num_cameras])
+        self.action_dim = int(train_args.get("action_dim", AGILEX_STATE_DIM))
+        self.use_robot_base = bool(train_args.get("use_robot_base", False))
+        self.cfg_scale = cfg_scale
+        self.ode_solver = ode_solver
+        self.num_inference_steps = (
+            int(num_inference_steps)
+            if num_inference_steps is not None
+            else int(train_args.get("num_inference_steps", 10))
+        )
+
+        # Build model with the *exact* training configuration.
+        self.model = ActionModel(
+            token_size=int(train_args.get("token_size", 2048)),
+            model_type=train_args.get("model_type", "DiT-B"),
+            in_channels=self.action_dim,
+            future_action_window_size=int(train_args.get("future_action_window", 13)),
+            past_action_window_size=int(train_args.get("past_action_window", 0)),
+            time_sampling=train_args.get("time_sampling", "logit_normal"),
+            logit_normal_loc=float(train_args.get("logit_normal_loc", 0.0)),
+            logit_normal_scale=float(train_args.get("logit_normal_scale", 1.0)),
+            beta_alpha=float(train_args.get("beta_alpha", 1.5)),
+            beta_beta=float(train_args.get("beta_beta", 1.0)),
+            num_timestep_buckets=int(train_args.get("num_timestep_buckets", 1000)),
+            use_vision_condition=True,
+            vision_backbone_type=train_args.get("vision_backbone", "resnet50"),
+            vision_pretrained=False,
+            num_cameras=self.num_cameras,
+            freeze_vision_backbone=False,
+            adapter_type=train_args.get("adapter_type", "mlp"),
+            class_dropout_prob=0.0,
+            n_obs_steps=self.n_obs_steps,
+            n_action_steps=self.n_action_steps,
+            temporal_agg=train_args.get("temporal_agg", "concat"),
+        )
+        self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        self.model.to(self.device).eval()
+
+        # Normalization stats. Prefer what the checkpoint stored; else fall back
+        # to a sibling pickle file.
+        stats = ckpt.get("norm_stats")
+        if stats is None:
+            default_path = stats_path or os.path.join(
+                os.path.dirname(os.path.abspath(checkpoint_path)),
+                train_args.get("stats_name", "dataset_stats.pkl"),
+            )
+            with open(default_path, "rb") as f:
+                stats = pickle.load(f)
+        self.qpos_mean = np.asarray(stats["qpos_mean"], dtype=np.float32)
+        self.qpos_std = np.asarray(stats["qpos_std"], dtype=np.float32)
+        self.action_mean = np.asarray(stats["action_mean"], dtype=np.float32)
+        self.action_std = np.asarray(stats["action_std"], dtype=np.float32)
+
+        # Observation cache (images are pre-normalized float32 (K, 3, H, W) arrays).
+        self._image_cache: Deque[np.ndarray] = deque(maxlen=self.n_obs_steps)
+        self._latest_qpos: Optional[np.ndarray] = None
+
+        # Rolling queue of actions that have already been sampled.
+        self.action_queue: List[np.ndarray] = []
+
+        self._imagenet_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self._imagenet_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+        print(
+            f"[AgileXPolicy] Ready — model={train_args.get('model_type')} "
+            f"action_dim={self.action_dim} n_obs_steps={self.n_obs_steps} "
+            f"n_action_steps={self.n_action_steps} num_cameras={self.num_cameras}"
+        )
+
+    # -------------------------------------------------------------- #
+    # Observation processing
+    # -------------------------------------------------------------- #
+
+    def preprocess_images(self, images_bgr: List[np.ndarray]) -> np.ndarray:
+        """Convert a list of per-camera BGR uint8 frames to (K, 3, H, W) float32.
+
+        Matches ``transforms.ToTensor + Normalize`` with ImageNet stats, sans
+        resize (training default on AgileX data).
+        """
+        if len(images_bgr) != self.num_cameras:
+            raise ValueError(
+                f"Expected {self.num_cameras} camera frames, got {len(images_bgr)}"
+            )
+        per_cam: List[np.ndarray] = []
+        for img in images_bgr:
+            if img.ndim != 3 or img.shape[2] != 3:
+                raise ValueError(f"Camera frame must be HxWx3, got shape {img.shape}")
+            arr = img.astype(np.float32) / 255.0
+            arr = (arr - self._imagenet_mean) / self._imagenet_std
+            arr = np.transpose(arr, (2, 0, 1))  # (3, H, W)
+            per_cam.append(arr)
+        return np.stack(per_cam, axis=0)  # (K, 3, H, W)
+
+    def reset(self) -> None:
+        """Clear cached observations and queued actions (call at episode start)."""
+        self._image_cache.clear()
+        self._latest_qpos = None
+        self.action_queue = []
+
+    def update_obs(self, images_bgr: List[np.ndarray], qpos: np.ndarray) -> None:
+        frame = self.preprocess_images(images_bgr)
+        if not self._image_cache:
+            for _ in range(self.n_obs_steps):
+                self._image_cache.append(frame)
+        else:
+            self._image_cache.append(frame)
+        self._latest_qpos = np.asarray(qpos, dtype=np.float32)
+
+    # -------------------------------------------------------------- #
+    # Inference
+    # -------------------------------------------------------------- #
+
+    @torch.no_grad()
+    def predict(self) -> np.ndarray:
+        """Run one ODE sampling pass and return the denormalized action chunk.
+
+        Returns:
+            actions: ``(n_action_steps, action_dim)`` numpy array in radians.
+        """
+        if self._latest_qpos is None or not self._image_cache:
+            raise RuntimeError("update_obs() must be called before predict().")
+
+        images = np.stack(list(self._image_cache), axis=0)  # (T, K, 3, H, W)
+        images = np.expand_dims(images, axis=0)  # (1, T, K, 3, H, W)
+        images_t = torch.from_numpy(images).float().to(self.device)
+
+        qpos_norm = (self._latest_qpos - self.qpos_mean) / self.qpos_std
+        state_t = torch.from_numpy(qpos_norm).float().unsqueeze(0).to(self.device)
+
+        out = self.model.sample(
+            images_t,
+            state=state_t,
+            num_steps=self.num_inference_steps,
+            ode_solver=self.ode_solver,
+            cfg_scale=self.cfg_scale,
+            return_all=False,
+        )  # (1, n_action_steps, action_dim)
+        out_np = out.cpu().numpy()[0]
+        return out_np * self.action_std + self.action_mean
+
+    def get_action(self, images_bgr: List[np.ndarray], qpos: np.ndarray) -> np.ndarray:
+        """Return the next action, re-planning when the execution queue is empty."""
+        self.update_obs(images_bgr, qpos)
+        if not self.action_queue:
+            chunk = self.predict()  # (n_action_steps, action_dim)
+            self.action_queue = [chunk[i] for i in range(chunk.shape[0])]
+        return self.action_queue.pop(0)
+
+
+# ------------------------------------------------------------------ #
+# ROS I/O layer
+# ------------------------------------------------------------------ #
+
+
+class AgileXRosBridge:
+    """Subscribe / publish wrapper (same topics as agx_robot ACT inference)."""
+
+    def __init__(self, args: argparse.Namespace):
+        if not _ROS_AVAILABLE:
+            raise RuntimeError(
+                "rospy / cv_bridge are not available. This script must be run on "
+                "the AgileX machine inside a ROS environment."
+            )
+        self.args = args
+        self.bridge = CvBridge()
+
+        self.img_front_deque: Deque = deque(maxlen=2000)
+        self.img_left_deque: Deque = deque(maxlen=2000)
+        self.img_right_deque: Deque = deque(maxlen=2000)
+        self.puppet_arm_left_deque: Deque = deque(maxlen=2000)
+        self.puppet_arm_right_deque: Deque = deque(maxlen=2000)
+        self.robot_base_deque: Deque = deque(maxlen=2000)
+
+        self._init_ros()
+
+    # ---- Subscribers ----
+    def _init_ros(self) -> None:
+        rospy.init_node("nemodit_agilex_inference", anonymous=True)
+        rospy.Subscriber(self.args.img_front_topic, Image, self._img_front_cb,
+                         queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.img_left_topic, Image, self._img_left_cb,
+                         queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.img_right_topic, Image, self._img_right_cb,
+                         queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.puppet_arm_left_topic, JointState,
+                         self._puppet_left_cb, queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.puppet_arm_right_topic, JointState,
+                         self._puppet_right_cb, queue_size=1000, tcp_nodelay=True)
+        if self.args.use_robot_base:
+            rospy.Subscriber(self.args.robot_base_topic, Odometry,
+                             self._robot_base_cb, queue_size=1000, tcp_nodelay=True)
+
+        self.pub_left = rospy.Publisher(self.args.puppet_arm_left_cmd_topic,
+                                        JointState, queue_size=10)
+        self.pub_right = rospy.Publisher(self.args.puppet_arm_right_cmd_topic,
+                                         JointState, queue_size=10)
+        if self.args.use_robot_base:
+            self.pub_base = rospy.Publisher(self.args.robot_base_cmd_topic,
+                                            Twist, queue_size=10)
+        else:
+            self.pub_base = None
+
+    # ---- Callbacks ----
+    def _img_front_cb(self, msg): self.img_front_deque.append(msg)
+    def _img_left_cb(self, msg): self.img_left_deque.append(msg)
+    def _img_right_cb(self, msg): self.img_right_deque.append(msg)
+    def _puppet_left_cb(self, msg): self.puppet_arm_left_deque.append(msg)
+    def _puppet_right_cb(self, msg): self.puppet_arm_right_deque.append(msg)
+    def _robot_base_cb(self, msg): self.robot_base_deque.append(msg)
+
+    # ---- Sync ----
+    def get_frame(self) -> Optional[Tuple[List[np.ndarray], np.ndarray]]:
+        """Return (images_bgr, qpos) for the most recent synchronized timestep.
+
+        Images are ordered to match ``AGILEX_CAMERA_NAMES`` =
+        ``[cam_high(front), cam_left_wrist(left), cam_right_wrist(right)]``.
+        """
+        if not (self.img_front_deque and self.img_left_deque and self.img_right_deque
+                and self.puppet_arm_left_deque and self.puppet_arm_right_deque):
+            return None
+        if self.args.use_robot_base and not self.robot_base_deque:
+            return None
+
+        frame_time = min(
+            self.img_front_deque[-1].header.stamp.to_sec(),
+            self.img_left_deque[-1].header.stamp.to_sec(),
+            self.img_right_deque[-1].header.stamp.to_sec(),
+        )
+
+        def _wait(deque_: Deque) -> bool:
+            return deque_[-1].header.stamp.to_sec() >= frame_time
+
+        if not all(_wait(d) for d in (self.img_front_deque, self.img_left_deque,
+                                      self.img_right_deque,
+                                      self.puppet_arm_left_deque,
+                                      self.puppet_arm_right_deque)):
+            return None
+        if self.args.use_robot_base and not _wait(self.robot_base_deque):
+            return None
+
+        def _drain(deque_: Deque):
+            while len(deque_) > 1 and deque_[0].header.stamp.to_sec() < frame_time:
+                deque_.popleft()
+            return deque_.popleft()
+
+        img_front = self.bridge.imgmsg_to_cv2(_drain(self.img_front_deque), "passthrough")
+        img_left = self.bridge.imgmsg_to_cv2(_drain(self.img_left_deque), "passthrough")
+        img_right = self.bridge.imgmsg_to_cv2(_drain(self.img_right_deque), "passthrough")
+        pup_left = _drain(self.puppet_arm_left_deque)
+        pup_right = _drain(self.puppet_arm_right_deque)
+
+        qpos = np.concatenate(
+            [np.asarray(pup_left.position, dtype=np.float32),
+             np.asarray(pup_right.position, dtype=np.float32)],
+            axis=0,
+        )
+        if self.args.use_robot_base:
+            base = _drain(self.robot_base_deque)
+            qpos = np.concatenate(
+                [qpos,
+                 np.asarray([base.twist.twist.linear.x,
+                             base.twist.twist.angular.z], dtype=np.float32)],
+                axis=0,
+            )
+
+        # cv_bridge passthrough preserves the camera encoding; for AgileX RealSense
+        # color streams this is typically BGR8, matching the training pipeline.
+        return [img_front, img_left, img_right], qpos
+
+    # ---- Publishing ----
+    def publish_arm(self, left_cmd: np.ndarray, right_cmd: np.ndarray) -> None:
+        msg = JointState()
+        msg.header = Header()
+        msg.header.stamp = rospy.Time.now()
+        msg.name = [f"joint{i}" for i in range(len(left_cmd))]
+        msg.position = left_cmd.tolist()
+        self.pub_left.publish(msg)
+        msg.position = right_cmd.tolist()
+        self.pub_right.publish(msg)
+
+    def publish_base(self, linear_x: float, angular_z: float) -> None:
+        if self.pub_base is None:
+            return
+        twist = Twist()
+        twist.linear.x = float(linear_x)
+        twist.angular.z = float(angular_z)
+        self.pub_base.publish(twist)
+
+
+# ------------------------------------------------------------------ #
+# Control loop
+# ------------------------------------------------------------------ #
+
+
+def run_inference(args: argparse.Namespace) -> None:
+    policy = AgileXPolicy(
+        checkpoint_path=args.checkpoint,
+        device=args.device,
+        num_inference_steps=args.num_inference_steps,
+        ode_solver=args.ode_solver,
+        cfg_scale=args.cfg_scale,
+        stats_path=args.stats_path,
+    )
+    bridge = AgileXRosBridge(args)
+
+    rate = rospy.Rate(args.publish_rate)
+    policy.reset()
+
+    print("[AgileX] Waiting for synchronized sensor data...")
+    first_print = True
+    with torch.inference_mode():
+        while not rospy.is_shutdown():
+            if args.max_steps is not None and args.max_steps <= 0:
+                break
+
+            frame = bridge.get_frame()
+            if frame is None:
+                if first_print:
+                    print("  waiting for camera / joint topics...")
+                    first_print = False
+                rate.sleep()
+                continue
+            first_print = True
+
+            images_bgr, qpos = frame
+            action = policy.get_action(images_bgr, qpos)
+
+            # Split 14-D (or 16-D with base) action back into left/right/base.
+            left_cmd = action[:7]
+            right_cmd = action[7:14]
+            bridge.publish_arm(left_cmd, right_cmd)
+            if policy.use_robot_base and action.shape[0] >= 16:
+                bridge.publish_base(action[14], action[15])
+
+            if args.max_steps is not None:
+                args.max_steps -= 1
+
+            rate.sleep()
+
+
+# ------------------------------------------------------------------ #
+# CLI
+# ------------------------------------------------------------------ #
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Real-robot NemoDiT inference for AgileX.")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to a .pt checkpoint produced by train_agilex.py")
+    parser.add_argument("--stats_path", type=str, default=None,
+                        help="Optional path to dataset_stats.pkl if not embedded in checkpoint")
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--num_inference_steps", type=int, default=None,
+                        help="Euler/midpoint ODE steps (defaults to value from checkpoint)")
+    parser.add_argument("--ode_solver", type=str, default="midpoint",
+                        choices=["euler", "midpoint"])
+    parser.add_argument("--cfg_scale", type=float, default=1.0)
+    parser.add_argument("--publish_rate", type=int, default=40)
+    parser.add_argument("--max_steps", type=int, default=None,
+                        help="Optional cap on total publish ticks (for scripted tests)")
+
+    # ROS topics (defaults mirror agx_robot/aloha-devel/act/inference.py).
+    parser.add_argument("--img_front_topic", type=str, default="/camera_f/color/image_raw")
+    parser.add_argument("--img_left_topic", type=str, default="/camera_l/color/image_raw")
+    parser.add_argument("--img_right_topic", type=str, default="/camera_r/color/image_raw")
+    parser.add_argument("--puppet_arm_left_topic", type=str, default="/puppet/joint_left")
+    parser.add_argument("--puppet_arm_right_topic", type=str, default="/puppet/joint_right")
+    parser.add_argument("--puppet_arm_left_cmd_topic", type=str, default="/master/joint_left")
+    parser.add_argument("--puppet_arm_right_cmd_topic", type=str, default="/master/joint_right")
+    parser.add_argument("--robot_base_topic", type=str, default="/odom_raw")
+    parser.add_argument("--robot_base_cmd_topic", type=str, default="/cmd_vel")
+    parser.add_argument("--use_robot_base", action="store_true", default=False,
+                        help="Enable if the checkpoint was trained with --use_robot_base")
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    if not _ROS_AVAILABLE:
+        raise SystemExit(
+            "rospy is not available. Source your ROS setup (e.g. "
+            "`source /opt/ros/noetic/setup.bash`) before running this script."
+        )
+    run_inference(parse_args())
