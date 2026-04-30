@@ -1,12 +1,7 @@
 """
 AgileX (Songling) robot data loader for NemoDiT.
 
-与 ``dataloader.py`` (RoboTwin) 的主要差异
-----------------------------------------
-AgileX/Mobile-Aloha 使用 cobot_magic 采集脚本，HDF5 结构为扁平的 14-D
-qpos/action + 3 个相机视角：
-
-.. code-block:: text
+HDF5 layout written by ``agx_robot/collect_data/collect_data.py``::
 
     episode_X.hdf5
     ├── attrs
@@ -18,17 +13,32 @@ qpos/action + 3 个相机视角：
     │   ├── effort     (T, 14)
     │   └── images/{cam_high, cam_left_wrist, cam_right_wrist}
     │                  (T, 480, 640, 3) uint8
-    ├── /action        (T, 14)     master arm 目标命令 (主臂示教)
+    ├── /action        (T, 14)     master arm 命令 (DROPPED — see below)
     └── /base_action   (T, 2)      [linear.x, angular.z]
 
-每只手臂的 7-D 布局为 ``[joint0..joint5, gripper]``。因此扁平 14-D 向量已经
-等价于 NemoDiT 的 ``[left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]``
-布局，可以直接作为 14-D action 输入使用，无需重排序。
+Each arm's 7-D layout ``[joint0..joint5, gripper]`` is bit-aligned with
+NemoDiT's ``[left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]``,
+so the flat 14-D vector is fed directly with no re-ordering.
 
-与 RoboTwin 版 dataloader 的另一个差异：state 来源。RoboTwin 里 state 取
-``action[0]``（仿真下 master/slave 一致），但 AgileX 采集中 master（/action）与
-slave（qpos）并不恒等，所以使用当前时刻的 ``qpos[t]`` 作为 state 更符合部署时
-真实机器人的观测。
+State / target convention (next-state prediction)
+-------------------------------------------------
+* ``state``  = ``qpos[t]``        (current observed joint positions)
+* ``target`` = ``qpos[t+1 .. t+W-1]``   (future observed joint positions)
+* ``/action`` from the HDF5 is **not used at all** — both state and target are
+  drawn from the same qpos stream, so a single set of normalization stats
+  suffices (``action_mean/std`` are kept as duplicates of ``qpos_mean/std`` for
+  backward compatibility with downstream code).
+
+This matches the agx_robot ACT dataloader (``aloha-devel/act/utils.py``):
+``actions = root['/observations/qpos'][1:]`` with last-frame repeat padding.
+
+Why ignore ``/action``?
+  * In tele-operation the master command and the slave's measured qpos differ
+    by both timing lag and tracking error.  Predicting future master commands
+    forces the model to learn that mismatch on top of the task itself.
+  * Predicting future qpos turns the policy into a clean next-state regressor;
+    the master then drives the slave to the predicted qpos, and tracking error
+    is handled by the lower-level controller (not the policy).
 """
 
 import os
@@ -125,29 +135,29 @@ def compute_agilex_norm_stats(
     if not files:
         raise ValueError(f"No episode files found in {data_path}")
 
+    # Stats are computed **only** from /observations/qpos because the prediction
+    # target is also qpos[t+1:] (we do not use /action). action_mean/std are
+    # therefore identical to qpos_mean/std and kept under both keys for
+    # backward compatibility with code that reads `action_*` from the dict.
     all_qpos: List[np.ndarray] = []
-    all_action: List[np.ndarray] = []
     for f_path in files:
         with h5py.File(f_path, "r") as root:
             qpos = root["/observations/qpos"][()].astype(np.float32)
-            action = root["/action"][()].astype(np.float32)
             if use_robot_base:
                 base = root["/base_action"][()].astype(np.float32)
                 qpos = np.concatenate([qpos, base], axis=1)
-                action = np.concatenate([action, base], axis=1)
         all_qpos.append(qpos)
-        all_action.append(action)
 
     qpos_cat = np.concatenate(all_qpos, axis=0)
-    action_cat = np.concatenate(all_action, axis=0)
+    qpos_mean = qpos_cat.mean(axis=0).astype(np.float32)
+    qpos_std = np.clip(qpos_cat.std(axis=0), 1e-2, None).astype(np.float32)
 
-    stats = {
-        "qpos_mean": qpos_cat.mean(axis=0).astype(np.float32),
-        "qpos_std": np.clip(qpos_cat.std(axis=0), 1e-2, None).astype(np.float32),
-        "action_mean": action_cat.mean(axis=0).astype(np.float32),
-        "action_std": np.clip(action_cat.std(axis=0), 1e-2, None).astype(np.float32),
+    return {
+        "qpos_mean": qpos_mean,
+        "qpos_std": qpos_std,
+        "action_mean": qpos_mean.copy(),
+        "action_std": qpos_std.copy(),
     }
-    return stats
 
 
 class AgileXDataset(Dataset):
@@ -266,22 +276,26 @@ class AgileXDataset(Dataset):
     # ------------------------------------------------------------------ #
 
     def _load_actions(self, f: h5py.File, start_idx: int) -> np.ndarray:
-        """Return ``(future_action_window, action_dim)`` action window.
+        """Return ``(future_action_window, action_dim)`` action window built from qpos.
 
-        Index 0 always corresponds to ``start_idx`` (= the current observation
-        timestep). The last observation frame in the returned window is used as
-        the model's ``state`` conditioning; the rest is the prediction target.
+        AgileX policy uses **qpos as both state and target** (mirroring the
+        agx_robot ACT convention in ``aloha-devel/act/utils.py``). The recorded
+        ``/action`` (master arm command) is ignored entirely.
+
+        Index 0 of the returned window corresponds to ``start_idx`` (= current
+        observation timestep, identical in value to ``state``). ``__getitem__``
+        drops index 0 so the prediction target is ``qpos[t+1 .. t+W-1]``.
         """
-        actions = f["/action"][()].astype(np.float32)  # (T, 14)
+        qpos_full = f["/observations/qpos"][()].astype(np.float32)  # (T, 14)
         if self.use_robot_base:
             base = f["/base_action"][()].astype(np.float32)
-            actions = np.concatenate([actions, base], axis=1)  # (T, 16)
+            qpos_full = np.concatenate([qpos_full, base], axis=1)  # (T, 16)
 
-        T_total = actions.shape[0]
-        # Delay shift mirrors the agx_robot ACT dataloader: when the master arm
-        # lags the slave by arm_delay_time frames the label is taken earlier.
+        # `arm_delay_time` shifts the target window earlier in time, which can
+        # be useful if there is a known sensor / actuation lag between the
+        # observation and where you want the policy to be heading. Default 0.
         idx = max(0, start_idx - self.arm_delay_time)
-        window = actions[idx : idx + self.future_action_window]
+        window = qpos_full[idx : idx + self.future_action_window]
 
         if window.shape[0] < self.future_action_window:
             pad = np.repeat(window[-1:], self.future_action_window - window.shape[0], axis=0)
@@ -330,15 +344,14 @@ class AgileXDataset(Dataset):
             actions = self._load_actions(f, timestep)  # (future_action_window, action_dim)
             obs_frames = self._load_obs_images(f, timestep, compressed)
 
-        # Normalize qpos / actions.
+        # Normalize. Both state and target use the same qpos stats (action_mean/std
+        # are duplicates of qpos_mean/std because the target is qpos-derived).
         state = (qpos - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
         actions_norm = (actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
-        # Align with RoboTwin convention: state corresponds to action[0];
-        # prediction target is action[1:].
-        # In AgileX data, action[0] is the master arm command at `timestep`, which
-        # corresponds to the slave qpos only after calibration. Using observed qpos
-        # as state (instead of action[0]) better matches deployment conditions.
+        # `actions[0] == qpos[t] == state` by construction. The DiT consumes the
+        # state as a separate clean token and only needs to predict W-1 frames,
+        # so we drop index 0 from the target.
         state_tensor = torch.from_numpy(state).float()
         actions_to_predict = torch.from_numpy(actions_norm[1:]).float()
 

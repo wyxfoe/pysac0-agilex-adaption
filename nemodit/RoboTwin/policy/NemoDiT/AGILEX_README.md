@@ -27,7 +27,7 @@ episode_X.hdf5
 │   ├── effort     (T, 14)
 │   └── images/{cam_high, cam_left_wrist, cam_right_wrist}
 │                  (T, 480, 640, 3) uint8
-├── /action        (T, 14)     master arm 命令 (主臂示教)
+├── /action        (T, 14)     master arm 命令 — 训练时**完全不使用**
 └── /base_action   (T, 2)      [linear.x, angular.z]
 ```
 
@@ -35,13 +35,16 @@ episode_X.hdf5
 
 1. **14-D 布局恰好等价于 NemoDiT 的 `joint` 模式**
    (`[left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]`)，无需重排。
-2. **采用 `/action` 作为目标，`/observations/qpos` 作为 state**。RoboTwin 里
-   `state = action[0]` 依赖 master/slave 一致；真机中两者会有滞后，因此
-   `inference_agilex.py` 和 `dataloader_agilex.py` 均使用当前帧 qpos。
+2. **state 与 target 都来自 `/observations/qpos`**：
+   - `state  = qpos[t]`
+   - `target = qpos[t+1 .. t+W-1]`
+   - `/action` 完全弃用 → 模型变成 next-state regressor。
+   - 归一化只用一套 qpos 统计（`action_mean/std` 在 dict 里仍存在，是
+     `qpos_mean/std` 的副本，方便老代码读 `action_*` 不报错）。
 3. **3 路相机**：`cam_high, cam_left_wrist, cam_right_wrist`（不再是 4 路）。
 4. **可选 `compress`** —— dataloader 会自动 `cv2.imdecode` 并 BGR→RGB。
 5. **可选机载底盘 (`/base_action`)** —— 训练 / 推理打开 `--use_robot_base` 后
-   qpos / action 维度变为 16。
+   qpos / target 维度变为 16。
 
 ## 2. 训练
 

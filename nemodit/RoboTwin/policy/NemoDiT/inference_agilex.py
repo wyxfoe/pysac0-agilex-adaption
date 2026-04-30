@@ -4,8 +4,16 @@ This script mirrors the topology of ``agx_robot/aloha-devel/act/inference.py``
 (ROS-based master/puppet arms + 3 RealSense cameras) but replaces the ACT
 policy with a trained ``ActionModel`` (Flow-Matching DiT). It reads a
 checkpoint produced by ``train_agilex.py`` — which embeds both the training
-hyper-parameters and the qpos/action normalization stats — so that the same
-file is sufficient for deployment.
+hyper-parameters and the qpos normalization stats — so that the same file is
+sufficient for deployment.
+
+Convention (matches ``dataloader_agilex.py``):
+  * Input  : qpos[t] (observed slave joints) -> state token; image frames -> vision token.
+  * Output : qpos[t+1 .. t+n_action_steps] (future joint positions).
+  * Predictions are sent as joint commands to /master/joint_left|right; the
+    master arm controller drives the slave to these target qpos.
+  * /action from the HDF5 was never read during training; we never produce
+    "master commands" directly, only desired qpos.
 
 Topology of a control tick:
   1. ROS callbacks buffer camera frames + joint states.
@@ -148,6 +156,11 @@ class AgileXPolicy:
             )
             with open(default_path, "rb") as f:
                 stats = pickle.load(f)
+        # AgileX dataloader trains state and target from the same qpos stream,
+        # so qpos_mean/std and action_mean/std are equal by construction. Reading
+        # them under both names lets us keep the symmetry: normalize the
+        # observed qpos with `qpos_*`, denormalize the predicted future qpos
+        # with `action_*`. They are numerically identical.
         self.qpos_mean = np.asarray(stats["qpos_mean"], dtype=np.float32)
         self.qpos_std = np.asarray(stats["qpos_std"], dtype=np.float32)
         self.action_mean = np.asarray(stats["action_mean"], dtype=np.float32)
