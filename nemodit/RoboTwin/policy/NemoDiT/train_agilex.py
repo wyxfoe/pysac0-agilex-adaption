@@ -19,6 +19,7 @@ import math
 import os
 import pickle
 from pathlib import Path
+from typing import List
 
 import torch
 from torch.cuda.amp import GradScaler, autocast
@@ -30,7 +31,7 @@ from dataloader_agilex import (
     AGILEX_CAMERA_NAMES,
     AGILEX_STATE_DIM,
     AgileXDataset,
-    action_dim_for,
+    agilex_action_dim,
     compute_agilex_norm_stats,
 )
 from model.action_model.action_model import ActionModel
@@ -54,13 +55,20 @@ def parse_args() -> argparse.Namespace:
                         help="Concatenate /base_action (2-D) onto qpos/action")
     parser.add_argument("--arm_delay_time", type=int, default=0,
                         help="Forward shift of action target in frames (default: 0)")
-    parser.add_argument("--arm", type=str, default="both",
-                        choices=["both", "left", "right"],
-                        help="Train on a single arm (7-D) or both arms (14-D, default).")
+    parser.add_argument("--exclude_terminal_padding", action="store_true", default=False,
+                        help="Drop episode-tail timesteps that need right-padding "
+                             "(avoids 'stay still' bias at episode end)")
+    parser.add_argument("--val_ratio", type=float, default=0.0,
+                        help="Fraction of episodes held out for validation (default: 0.0 = no val).")
+    parser.add_argument("--val_seed", type=int, default=0,
+                        help="Seed for the train/val episode shuffle (default: 0).")
+    parser.add_argument("--val_every", type=int, default=10,
+                        help="Run validation every N epochs (only when --val_ratio > 0).")
 
     # Temporal windows
     parser.add_argument("--future_action_window", type=int, default=13,
-                        help="Total action window (state + predictions); predicts window-1 steps")
+                        help="Total action window (= state slot + predicted frames). The model "
+                             "predicts (future_action_window - 1) frames; default 13 -> 12 predicted.")
     parser.add_argument("--past_action_window", type=int, default=0)
     parser.add_argument("--n_obs_steps", type=int, default=2,
                         help="Number of past frames fed to the vision encoder")
@@ -150,45 +158,90 @@ def build_transform(args: argparse.Namespace) -> transforms.Compose:
 
 
 def prepare_dataloader(args: argparse.Namespace):
+    """Build train (and optional val) dataloaders + normalization stats.
+
+    Stats are computed **only on the training split** and shared with the val
+    set, mirroring agx_robot ACT's train/val convention.
+    """
     transform = build_transform(args)
 
     # Use explicit episode_ids so stats computation and dataset iteration agree
     # even when numeric ids include gaps (avoids lexicographic sort pitfalls
     # like episode_10 sorting before episode_2 in a naive glob slice).
-    episode_ids = None
     if args.num_episodes is not None:
-        episode_ids = list(range(args.num_episodes))
+        all_ids = list(range(args.num_episodes))
+    else:
+        # Fall back to scanning the directory.
+        from dataloader_agilex import _list_episode_files  # local import
+        all_ids = []
+        for path in _list_episode_files(args.data_path, None):
+            stem = Path(path).stem
+            try:
+                all_ids.append(int(stem.split("_")[-1]))
+            except ValueError:
+                continue
+        all_ids.sort()
+
+    # Train / val split.
+    val_ids: List[int] = []
+    train_ids = list(all_ids)
+    if args.val_ratio > 0.0 and len(all_ids) > 1:
+        import random
+
+        rng = random.Random(args.val_seed)
+        shuffled = list(all_ids)
+        rng.shuffle(shuffled)
+        n_val = max(1, int(round(args.val_ratio * len(shuffled))))
+        val_ids = sorted(shuffled[:n_val])
+        train_ids = sorted(shuffled[n_val:])
+    print(f"[Split] train_episodes={len(train_ids)} val_episodes={len(val_ids)}")
 
     stats = compute_agilex_norm_stats(
         args.data_path,
         use_robot_base=args.use_robot_base,
-        episode_ids=episode_ids,
-        arm=args.arm,
+        episode_ids=train_ids,
     )
 
-    dataset = AgileXDataset(
-        data_path=args.data_path,
-        norm_stats=stats,
-        future_action_window=args.future_action_window,
-        past_action_window=args.past_action_window,
-        transform=transform,
-        camera_names=args.camera_names,
-        num_cameras=args.num_cameras,
-        n_obs_steps=args.n_obs_steps,
-        use_robot_base=args.use_robot_base,
-        arm_delay_time=args.arm_delay_time,
-        episode_ids=episode_ids,
-        arm=args.arm,
-    )
-    loader = DataLoader(
-        dataset,
+    def _make_dataset(episode_ids: List[int]) -> AgileXDataset:
+        return AgileXDataset(
+            data_path=args.data_path,
+            norm_stats=stats,
+            future_action_window=args.future_action_window,
+            past_action_window=args.past_action_window,
+            transform=transform,
+            camera_names=args.camera_names,
+            num_cameras=args.num_cameras,
+            n_obs_steps=args.n_obs_steps,
+            use_robot_base=args.use_robot_base,
+            arm_delay_time=args.arm_delay_time,
+            episode_ids=episode_ids,
+            exclude_terminal_padding=args.exclude_terminal_padding,
+        )
+
+    train_dataset = _make_dataset(train_ids)
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
     )
-    return loader, dataset, stats
+
+    val_loader = None
+    val_dataset = None
+    if val_ids:
+        val_dataset = _make_dataset(val_ids)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+    return train_loader, train_dataset, val_loader, val_dataset, stats
 
 
 def build_model(args: argparse.Namespace) -> ActionModel:
@@ -272,15 +325,35 @@ def load_checkpoint(model, optimizer, scheduler, scaler, ema_model, path):
     return ckpt["epoch"], ckpt["global_step"]
 
 
+@torch.no_grad()
+def run_validation(model, val_loader, device, use_amp: bool) -> float:
+    """Compute mean Flow-Matching loss over the validation set."""
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+    for batch in val_loader:
+        images = batch["images"].to(device)
+        state = batch["state"].to(device)
+        actions = batch["actions"].to(device)
+        if use_amp:
+            with autocast():
+                loss = model.loss(x=actions, images=images, state=state)
+        else:
+            loss = model.loss(x=actions, images=images, state=state)
+        total_loss += loss.item()
+        n_batches += 1
+    model.train()
+    return total_loss / max(1, n_batches)
+
+
 def train():
     args = parse_args()
 
-    # Action dim is fully determined by the AgileX layout + arm selection.
-    args.action_dim = action_dim_for(args.arm, args.use_robot_base)
+    # AgileX is always dual-arm 14-D (+2 if robot base is enabled).
+    args.action_dim = agilex_action_dim(args.use_robot_base)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    arm_desc = {"both": "dual-arm", "left": "left-arm only", "right": "right-arm only"}[args.arm]
-    print(f"action_dim={args.action_dim} (AgileX {arm_desc}{' + base' if args.use_robot_base else ''})")
+    print(f"action_dim={args.action_dim} (AgileX dual-arm{' + base' if args.use_robot_base else ''})")
     print(f"n_obs_steps={args.n_obs_steps} n_action_steps={args.n_action_steps} "
           f"future_action_window={args.future_action_window} temporal_agg={args.temporal_agg}")
 
@@ -295,8 +368,10 @@ def train():
         )
 
     print("Loading dataset and computing normalization stats...")
-    loader, dataset, stats = prepare_dataloader(args)
-    print(f"Dataset size: {len(dataset)} | Batches: {len(loader)}")
+    train_loader, train_dataset, val_loader, val_dataset, stats = prepare_dataloader(args)
+    print(f"Train dataset size: {len(train_dataset)} | Batches: {len(train_loader)}")
+    if val_loader is not None:
+        print(f"Val   dataset size: {len(val_dataset)} | Batches: {len(val_loader)}")
 
     # Persist normalization stats standalone for convenience (inference also reads from ckpt).
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -333,9 +408,10 @@ def train():
 
     print("Starting training...")
     model.train()
+    best_val_loss = float("inf")
     for epoch in range(start_epoch, args.epochs):
         epoch_loss = 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
         for batch_idx, batch in enumerate(pbar):
             images = batch["images"].to(device)
             state = batch["state"].to(device)
@@ -381,7 +457,23 @@ def train():
             })
 
         scheduler.step()
-        print(f"Epoch {epoch + 1} done. Avg loss={epoch_loss / len(loader):.4f}")
+        train_avg = epoch_loss / max(1, len(train_loader))
+        print(f"Epoch {epoch + 1} done. train_loss={train_avg:.4f}")
+
+        # Validation pass.
+        if val_loader is not None and args.val_every > 0 \
+                and ((epoch + 1) % args.val_every == 0 or epoch == args.epochs - 1):
+            val_loss = run_validation(model, val_loader, device, args.use_amp)
+            print(f"           val_loss  ={val_loss:.4f}")
+            if wandb_logger:
+                wandb_logger.log({"val/loss": val_loss, "val/epoch": epoch + 1},
+                                 step=global_step)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(model, optimizer, scheduler, scaler, ema_model, stats,
+                                epoch + 1, global_step, args, filename="best.pt")
+                print(f"           best val so far -> saved best.pt (loss={val_loss:.4f})")
+
         if (epoch + 1) % args.save_every == 0:
             save_checkpoint(model, optimizer, scheduler, scaler, ema_model, stats,
                             epoch + 1, global_step, args)

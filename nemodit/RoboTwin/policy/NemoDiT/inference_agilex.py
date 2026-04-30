@@ -59,8 +59,7 @@ except ImportError:  # pragma: no cover
 from dataloader_agilex import (
     AGILEX_CAMERA_NAMES,
     AGILEX_STATE_DIM,
-    _select_arm,
-    action_dim_for,
+    agilex_action_dim,
 )
 from model.action_model.action_model import ActionModel
 
@@ -98,15 +97,11 @@ class AgileXPolicy:
         self.camera_names = train_args.get("camera_names") or AGILEX_CAMERA_NAMES
         self.camera_names = list(self.camera_names[: self.num_cameras])
         self.use_robot_base = bool(train_args.get("use_robot_base", False))
-        self.arm = str(train_args.get("arm", "both"))
-        if self.arm not in ("both", "left", "right"):
-            raise ValueError(f"Invalid arm={self.arm!r} in checkpoint args")
-        expected_dim = action_dim_for(self.arm, self.use_robot_base)
+        expected_dim = agilex_action_dim(self.use_robot_base)
         self.action_dim = int(train_args.get("action_dim", expected_dim))
         assert self.action_dim == expected_dim, (
             f"Checkpoint action_dim={self.action_dim} disagrees with "
-            f"arm={self.arm}, use_robot_base={self.use_robot_base} "
-            f"(expected {expected_dim})"
+            f"use_robot_base={self.use_robot_base} (expected {expected_dim})"
         )
         self.cfg_scale = cfg_scale
         self.ode_solver = ode_solver
@@ -231,9 +226,7 @@ class AgileXPolicy:
         images = np.expand_dims(images, axis=0)  # (1, T, K, 3, H, W)
         images_t = torch.from_numpy(images).float().to(self.device)
 
-        # Slice qpos to the active arm (+ optional base) before normalizing.
-        qpos_arm = _select_arm(self._latest_qpos, self.arm)
-        qpos_norm = (qpos_arm - self.qpos_mean) / self.qpos_std
+        qpos_norm = (self._latest_qpos - self.qpos_mean) / self.qpos_std
         state_t = torch.from_numpy(qpos_norm).float().unsqueeze(0).to(self.device)
 
         out = self.model.sample(
@@ -385,15 +378,9 @@ class AgileXRosBridge:
         msg.position = positions.tolist()
         return msg
 
-    def publish_left(self, left_cmd: np.ndarray) -> None:
+    def publish_arms(self, left_cmd: np.ndarray, right_cmd: np.ndarray) -> None:
         self.pub_left.publish(self._build_joint_state(left_cmd))
-
-    def publish_right(self, right_cmd: np.ndarray) -> None:
         self.pub_right.publish(self._build_joint_state(right_cmd))
-
-    def publish_both(self, left_cmd: np.ndarray, right_cmd: np.ndarray) -> None:
-        self.publish_left(left_cmd)
-        self.publish_right(right_cmd)
 
     def publish_base(self, linear_x: float, angular_z: float) -> None:
         if self.pub_base is None:
@@ -442,22 +429,10 @@ def run_inference(args: argparse.Namespace) -> None:
             images_bgr, qpos = frame
             action = policy.get_action(images_bgr, qpos)
 
-            # Publish only to the arm(s) the policy was trained for.
-            #   both : action is 14-D (+2 with base) -> publish both arms
-            #   left : action is 7-D  (+2 with base) -> publish left only
-            #   right: action is 7-D  (+2 with base) -> publish right only
-            if policy.arm == "both":
-                bridge.publish_both(action[:7], action[7:14])
-                base_offset = 14
-            elif policy.arm == "left":
-                bridge.publish_left(action[:7])
-                base_offset = 7
-            else:  # right
-                bridge.publish_right(action[:7])
-                base_offset = 7
-
-            if policy.use_robot_base and action.shape[0] >= base_offset + 2:
-                bridge.publish_base(action[base_offset], action[base_offset + 1])
+            # Action is 14-D (+2 with base): [left(7), right(7), (linear.x, angular.z)?]
+            bridge.publish_arms(action[:7], action[7:14])
+            if policy.use_robot_base and action.shape[0] >= 16:
+                bridge.publish_base(action[14], action[15])
 
             if args.max_steps is not None:
                 args.max_steps -= 1

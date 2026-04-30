@@ -38,7 +38,12 @@ temporal_agg="concat"
 num_cameras=3                # cam_high, cam_left_wrist, cam_right_wrist
 use_robot_base=""            # set to "--use_robot_base" for mobile base tasks
 arm_delay_time=0
-arm="both"                   # both (14-D) | left (7-D) | right (7-D)
+exclude_terminal=""          # set to "--exclude_terminal_padding" to drop tail samples
+
+# Validation split
+val_ratio=0.1                # 0.0 disables validation
+val_every=10
+val_seed=0
 
 epochs=500
 batch_size=32
@@ -75,7 +80,10 @@ python train_agilex.py \
     --num_cameras "${num_cameras}" \
     ${use_robot_base} \
     --arm_delay_time "${arm_delay_time}" \
-    --arm "${arm}" \
+    ${exclude_terminal} \
+    --val_ratio "${val_ratio}" \
+    --val_every "${val_every}" \
+    --val_seed "${val_seed}" \
     --model_type "${model_type}" \
     --vision_backbone "${vision_backbone}" \
     --vision_pretrained \

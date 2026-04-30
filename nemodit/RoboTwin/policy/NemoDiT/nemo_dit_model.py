@@ -316,10 +316,13 @@ class NemoDiT:
         state = self._prepare_state_input()
 
         # 使用 model.sample() 进行推理，截取 n_action_steps 步用于执行
+        # NOTE: __init__ stores self.num_inference_steps (not self.ddim_steps),
+        # so use that name here to avoid an AttributeError at deploy time.
         action_pred = self.model.sample(
             images,
             state=state,
-            ddim_steps=self.ddim_steps,
+            num_steps=self.num_inference_steps,
+            ode_solver=self.ode_solver,
             cfg_scale=1.0,  # 无 classifier-free guidance
             return_all=False  # 只返回 n_action_steps 步
         )  # (1, n_action_steps, action_dim)

@@ -101,28 +101,53 @@ bash train_agilex.sh pick_place 50 0 0 ~/data
 | `--temporal_agg` | 多帧特征聚合 (`last/mean/concat`) | `concat` |
 | `--use_robot_base` | 把 `/base_action` 拼接到 qpos/action | `False` |
 | `--arm_delay_time` | 前移 action 目标帧数 (同 ACT dataloader) | `0` |
-| `--arm` | `both` (14-D) / `left` / `right` (各 7-D) | `both` |
+| `--exclude_terminal_padding` | 丢掉 episode 末端需要 padding 的样本 | `False` |
+| `--val_ratio` / `--val_every` | 验证集比例 / 验证频率 | `0.0 / 10` |
 | `--use_amp` | AMP fp16 | `False` |
 | `--use_ema` | EMA 权重 | `False` |
+| `--dropout_prob` | CFG 训练时条件丢弃概率（推理 `--cfg_scale > 1` 才生效） | `0.1` |
 
 > **约束**：`n_obs_steps + n_action_steps <= future_action_window`。
 
-### 2.4.1 只训练右臂 (常见用例)
+### 2.4.1 单臂任务约定（无单/双臂分支）
 
-当采集过程中左臂一直静止时（用 `inspect_hdf5.py` 会看到 `qpos[0:7]` 的 std
-全是 0），可以切到单臂模式。action_dim 变 7，推理时也只对右臂下发命令，非活动
-臂完全不发布。
+任何 AgileX 数据都按 **14-D 双臂** 训练。即使采集时只动一只手臂（另一只
+qpos 几乎恒定），也保留 14 维：
+
+- 静止那一侧会被归一化成接近常数的目标，模型几乎无代价学到。
+- 推理时仍向 `/master/joint_left` 和 `/master/joint_right` 各发一组命令；
+  静止侧会回到训练数据中那个常量姿态（一般就是采集时的"静止位"），可以当作
+  自动的安全姿势锁定。
+
+如果你担心静止维度被 `std` clip (1e-2) 后放大噪声，可以：
+- 用 `inspect_hdf5.py --only /observations/qpos` 检查每维真实 std；
+- 或不动它（推荐）—— 静止数据的归一化噪声本身也微小。
+
+### 2.4.2 验证集 / 早停
 
 ```bash
 python train_agilex.py \
-    --data_path ~/data/right_task \
-    --num_episodes 50 \
-    --arm right \
-    --num_cameras 3 \
-    --checkpoint_dir checkpoints/right-50
+    --data_path ~/data/pick_place \
+    --num_episodes 100 \
+    --val_ratio 0.1 --val_every 10 --val_seed 0 \
+    --checkpoint_dir checkpoints/pick-100
 ```
 
-shell 脚本里改顶部 `arm="right"` 即可。左臂训练同理，`arm=left`。
+- `val_ratio` 按 episode 切分（同一个 episode 不会同时进 train / val）。
+- 归一化统计**只用训练集**计算。
+- 每 `val_every` 个 epoch 跑一次验证，val_loss 创新低时落盘 `best.pt`。
+
+### 2.4.3 Episode 末端 padding
+
+采集脚本写出的 episode 长度固定（例如 200 帧），dataloader 默认对最后
+`future_action_window` 帧用末帧重复填充。这会教模型"快结束时就别动"。
+若不想要这种偏置：
+
+```bash
+python train_agilex.py ... --exclude_terminal_padding
+```
+
+会丢掉约 `future_action_window / episode_length ≈ 6%` 的样本，但训练目标更干净。
 
 ### 2.5 Dataloader 自检
 
@@ -175,11 +200,22 @@ checkpoint 中已嵌入 `args` 与 `norm_stats`，无需额外传递。若仅有
 4. `qpos` 按训练时的 mean/std 归一化，作为 DiT `state` token。
 5. `ActionModel.sample(num_steps, ode_solver, cfg_scale)` 生成
    `(1, n_action_steps, action_dim)` 动作；反归一化后入队。
-6. 每个 tick 从队列弹出一帧，根据 checkpoint 中的 `arm` 设置决定发布目标：
-   - `arm=both`：action[:7] → `/master/joint_left`, action[7:14] → `/master/joint_right`
-   - `arm=left`：action[:7] → `/master/joint_left` (右臂不发)
-   - `arm=right`：action[:7] → `/master/joint_right` (左臂不发)
-   若训练时开了 base，再解包 `action[base_offset:base_offset+2]` 发到 `/cmd_vel`。
+6. 每个 tick 从队列弹出一帧，14-D 切两半发布：
+   - `action[:7]`  → `/master/joint_left`
+   - `action[7:14]` → `/master/joint_right`
+   若训练时开了 base (`use_robot_base`)，再解包 `action[14:16]` 发到 `/cmd_vel`。
+
+### 3.2.1 启用 Classifier-Free Guidance（可选）
+
+训练时默认 `--dropout_prob 0.1`，意味着 10% 的样本会用无条件 token 替换视觉
+条件。推理时只要把 `--cfg_scale > 1` 调高，就能用 guidance：
+
+```bash
+python inference_agilex.py --checkpoint final.pt --cfg_scale 1.5
+```
+
+`cfg_scale=1.0`（默认）等价于无 guidance，相当于训练时的 dropout 白浪费。
+真机上可以从 `1.0 → 1.3 → 1.5` 渐增观察控制是否更稳。
 
 ### 3.3 与 ACT 推理的差异
 
@@ -218,8 +254,8 @@ pip install torch torchvision h5py numpy tqdm timm opencv-python wandb
 2. **关节顺序**
    - AgileX `puppet_arm_left.position` 为 7-D 向量；末位是夹爪。和 NemoDiT
      `[left_arm(6), left_gripper(1), ...]` 字节对齐，不需重排。
-   - 单臂模式 (`--arm left/right`) 下，action / state 都是 7-D (单臂本身)；
-     推理只发布该侧话题，非活动臂不会收到任何命令。
+   - **统一 14-D**：训练 / 推理都用 14 维，不管数据里某一侧是否在动。
+     静止侧会被模型学成常量姿态，部署时同样发布到对应 `/master/joint_*`。
 3. **归一化统计**
    - 推理时必须使用训练集相同的 `qpos_mean/std` & `action_mean/std`。
      checkpoint 已内嵌，优先从 checkpoint 读；失败才回落到 `dataset_stats.pkl`。
