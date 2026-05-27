@@ -354,6 +354,8 @@ class AgileXRosBridge:
             return None
 
         def _drain(deque_: Deque):
+            # Exhaust all messages older than `frame_time`, then return the
+            # first one with stamp >= frame_time (matches ACT's drain loop).
             while len(deque_) > 1 and deque_[0].header.stamp.to_sec() < frame_time:
                 deque_.popleft()
             return deque_.popleft()
@@ -403,10 +405,62 @@ class AgileXRosBridge:
         twist.angular.z = float(angular_z)
         self.pub_base.publish(twist)
 
+    # ---- Soft-start ----
+    def soft_start_to_pose(
+        self,
+        target_left: np.ndarray,
+        target_right: np.ndarray,
+        step_size: float = 0.01,
+        rate_hz: int = 200,
+    ) -> None:
+        """Slowly move both master arms from their current position to a target pose.
+
+        Mirrors ``agx_robot/aloha-devel/act/inference.puppet_arm_publish_continuous``:
+        each tick advances every joint by at most ``step_size`` toward the
+        target until all joints have arrived. Prevents the slave from snapping
+        when the policy's first prediction is far from the current pose.
+        """
+        # Wait for at least one observation from each arm so we know where we are.
+        rate = rospy.Rate(rate_hz)
+        while (not rospy.is_shutdown()) and (
+            not self.puppet_arm_left_deque or not self.puppet_arm_right_deque
+        ):
+            rate.sleep()
+        if rospy.is_shutdown():
+            return
+
+        left_cur = np.asarray(self.puppet_arm_left_deque[-1].position, dtype=np.float32)
+        right_cur = np.asarray(self.puppet_arm_right_deque[-1].position, dtype=np.float32)
+        target_left = np.asarray(target_left, dtype=np.float32)
+        target_right = np.asarray(target_right, dtype=np.float32)
+
+        while not rospy.is_shutdown():
+            left_diff = target_left - left_cur
+            right_diff = target_right - right_cur
+            left_cur = left_cur + np.clip(left_diff, -step_size, step_size)
+            right_cur = right_cur + np.clip(right_diff, -step_size, step_size)
+            self.publish_arms(left_cur, right_cur)
+            if (np.all(np.abs(target_left - left_cur) <= 1e-6)
+                    and np.all(np.abs(target_right - right_cur) <= 1e-6)):
+                break
+            rate.sleep()
+
 
 # ------------------------------------------------------------------ #
 # Control loop
 # ------------------------------------------------------------------ #
+
+
+def _parse_pose_arg(s: Optional[str], expected_dim: int = 7) -> Optional[np.ndarray]:
+    """Parse comma-separated floats into a numpy array, or return None."""
+    if not s:
+        return None
+    parts = [float(x) for x in s.split(",")]
+    if len(parts) != expected_dim:
+        raise ValueError(
+            f"Expected {expected_dim} comma-separated values, got {len(parts)}: {s!r}"
+        )
+    return np.asarray(parts, dtype=np.float32)
 
 
 def run_inference(args: argparse.Namespace) -> None:
@@ -420,37 +474,102 @@ def run_inference(args: argparse.Namespace) -> None:
     )
     bridge = AgileXRosBridge(args)
 
-    rate = rospy.Rate(args.publish_rate)
-    policy.reset()
+    # 1. Soft-start: ramp master to a home pose so the first policy prediction
+    #    can't yank the slave across joint space. Defaults match ACT inference's
+    #    `left0 / right0` constants; users can override via CLI.
+    if not args.no_soft_start:
+        left0 = _parse_pose_arg(args.soft_start_left, 7) or np.array(
+            [-0.00133514, 0.00209808, 0.01583099, -0.03261662,
+             -0.00286102, 0.00095367, 3.55783081], dtype=np.float32
+        )
+        right0 = _parse_pose_arg(args.soft_start_right, 7) or np.array(
+            [-0.00133514, 0.00438690, 0.03452396, -0.05359745,
+             -0.00476837, -0.00209808, 3.55783081], dtype=np.float32
+        )
+        print("[AgileX] Soft-starting to home pose...")
+        bridge.soft_start_to_pose(left0, right0, step_size=args.soft_start_step)
+        if args.soft_start_pause:
+            try:
+                input("[AgileX] Soft-start done. Press <Enter> to begin policy inference...")
+            except EOFError:
+                pass
 
-    print("[AgileX] Waiting for synchronized sensor data...")
-    first_print = True
-    with torch.inference_mode():
+    # 2. Threaded inference: model.sample() can take 50-150ms; if we ran it in
+    #    the publish loop we'd miss ticks at publish_rate=40Hz. Inference thread
+    #    pulls a fresh frame on demand, fills the queue, signals "ready".
+    inference_lock = threading.Lock()
+    state = {
+        "shutdown": False,
+        "ready": False,                       # True once at least one prediction is queued
+        "wants_replan": True,                 # True when the queue should be refilled
+    }
+
+    def _inference_worker():
+        while not rospy.is_shutdown() and not state["shutdown"]:
+            with inference_lock:
+                wants = state["wants_replan"]
+            if not wants:
+                rospy.sleep(0.001)
+                continue
+            frame = bridge.get_frame()
+            if frame is None:
+                rospy.sleep(0.005)
+                continue
+            images_bgr, qpos = frame
+            # First call also seeds the n_obs_steps deque.
+            with torch.inference_mode():
+                policy.update_obs(images_bgr, qpos)
+                chunk = policy.predict()  # (n_action_steps, action_dim)
+            with inference_lock:
+                policy.action_queue = [chunk[i] for i in range(chunk.shape[0])]
+                state["ready"] = True
+                state["wants_replan"] = False
+
+    inference_thread = threading.Thread(target=_inference_worker, daemon=True)
+    inference_thread.start()
+
+    # 3. Publish loop at fixed publish_rate; replans when the queue drains.
+    rate = rospy.Rate(args.publish_rate)
+    print(f"[AgileX] Publishing at {args.publish_rate} Hz (Ctrl+C to stop)...")
+    last_action: Optional[np.ndarray] = None
+    try:
         while not rospy.is_shutdown():
             if args.max_steps is not None and args.max_steps <= 0:
                 break
 
-            frame = bridge.get_frame()
-            if frame is None:
-                if first_print:
-                    print("  waiting for camera / joint topics...")
-                    first_print = False
+            with inference_lock:
+                if not state["ready"]:
+                    queued = []
+                else:
+                    queued = policy.action_queue
+
+            if queued:
+                action = queued.pop(0)
+                with inference_lock:
+                    if not policy.action_queue:
+                        state["wants_replan"] = True  # ask worker to fetch next chunk
+                last_action = action
+            elif last_action is not None:
+                # Queue is empty and replan in flight: hold the last command so
+                # the master doesn't go limp during the inference gap.
+                action = last_action
+            else:
+                # No prediction yet at all — wait.
                 rate.sleep()
                 continue
-            first_print = True
 
-            images_bgr, qpos = frame
-            action = policy.get_action(images_bgr, qpos)
-
-            # Action is 14-D (+2 with base): [left(7), right(7), (linear.x, angular.z)?]
             bridge.publish_arms(action[:7], action[7:14])
             if policy.use_robot_base and action.shape[0] >= 16:
                 bridge.publish_base(action[14], action[15])
 
             if args.max_steps is not None:
                 args.max_steps -= 1
-
             rate.sleep()
+    finally:
+        # Graceful shutdown: stop the inference thread.
+        state["shutdown"] = True
+        inference_thread.join(timeout=2.0)
+        print("[AgileX] Inference stopped.")
 
 
 # ------------------------------------------------------------------ #
@@ -473,6 +592,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--publish_rate", type=int, default=40)
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Optional cap on total publish ticks (for scripted tests)")
+
+    # Soft-start (ramp master to a home pose before policy takes over).
+    parser.add_argument("--no_soft_start", action="store_true", default=False,
+                        help="Skip the ramp-to-home-pose step at startup.")
+    parser.add_argument("--soft_start_left", type=str, default=None,
+                        help="Comma-separated 7-D left arm home pose; overrides default.")
+    parser.add_argument("--soft_start_right", type=str, default=None,
+                        help="Comma-separated 7-D right arm home pose; overrides default.")
+    parser.add_argument("--soft_start_step", type=float, default=0.01,
+                        help="Max joint delta per tick during soft-start (rad/tick).")
+    parser.add_argument("--soft_start_pause", action="store_true", default=False,
+                        help="Pause for an Enter keypress after soft-start (like ACT).")
 
     # ROS topics (defaults mirror agx_robot/aloha-devel/act/inference.py).
     parser.add_argument("--img_front_topic", type=str, default="/camera_f/color/image_raw")

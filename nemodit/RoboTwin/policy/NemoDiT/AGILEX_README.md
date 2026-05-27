@@ -7,7 +7,7 @@ cobot_magic 采集栈 + `agx_robot` ACT pipeline) 的三个文件：
 |------|------|
 | `dataloader_agilex.py` | 读取 `collect_data.py` 保存的扁平 14-D AgileX HDF5 |
 | `train_agilex.py` / `train_agilex.sh` | 在 AgileX 数据上训练 Flow-Matching DiT |
-| `inference_agilex.py` | 真机 ROS 推理 (camera → 模型 → puppet arm cmd) |
+| `inference_agilex.py` / `deploy_agilex.sh` | ROS1 真机推理 (camera → 模型 → puppet arm cmd) |
 
 原 `dataloader.py` / `train.py` / `eval.py` / `deploy_policy.py` 仍保留用于
 RoboTwin 仿真。
@@ -195,10 +195,37 @@ python inference_agilex.py \
 checkpoint 中已嵌入 `args` 与 `norm_stats`，无需额外传递。若仅有裸模型权重，
 用 `--stats_path /path/to/dataset_stats.pkl` 指定。
 
-### 3.2 控制循环
+### 3.2 控制循环（两线程模型）
+
+```
+┌────────────────────────────┐         ┌──────────────────────────┐
+│  Inference thread          │         │  Publish thread (主)      │
+│                            │         │                          │
+│  1. get_frame() 同步        │         │  rospy.Rate(publish_rate)│
+│  2. update_obs(deque)       │ queue   │  pop action from queue   │
+│  3. policy.predict()        │ ─────►  │  split [:7]/[7:14] →     │
+│     (ODE 10步, ~50-150ms)   │         │  publish_arms()          │
+│  4. fill action_queue       │         │  当队列空: 重新触发       │
+│  5. wait for replan signal  │         │     wants_replan=True    │
+└────────────────────────────┘         └──────────────────────────┘
+```
+
+- 推理线程独立于 publish loop，避免 ODE 采样卡住 40Hz 节拍。
+- 队列空 + 新推理在路上时，**持续发布上一帧动作** (`last_action` hold)，
+  保证主臂不会"卡 0"。
+- Ctrl+C 触发 `finally` 通知推理线程退出。
+
+**首启动 soft-start**：默认从当前从臂位置以 `--soft_start_step` (默认 0.01 rad/tick) 的速度
+线性插值到 home pose（见代码内置 `left0/right0` 常量），完成后才允许策略接管。
+`--soft_start_pause` 会在 ramp 结束后等待 Enter（首次运行新任务推荐打开）。
+
+跳过 soft-start：`--no_soft_start`。
+自定义 home pose：`--soft_start_left "0,0,...,0" --soft_start_right "0,0,...,0"`（各 7 维）。
+
+### 3.3 数据流细节
 
 1. ROS callbacks 缓冲相机帧 + 从臂 JointState。
-2. `get_frame()` 取最新同步帧；缺失则 `rate.sleep()`。
+2. `get_frame()` 取最新同步帧（exhaust-and-popleft）；缺失则等。
 3. 观测进入长度 `n_obs_steps` 的 deque (首轮复制填充)。
 4. `qpos` 按训练时的 mean/std 归一化，作为 DiT `state` token。
 5. `ActionModel.sample(num_steps, ode_solver, cfg_scale)` 生成
@@ -241,10 +268,44 @@ python inference_agilex.py --checkpoint final.pt --cfg_scale 1.5
 pip install torch torchvision h5py numpy tqdm timm opencv-python wandb
 ```
 
-### 真机 (AgileX)
-- ROS Noetic (aloha 环境见 `agx_robot/aloha.yml`)
-- `rospy, cv_bridge, sensor_msgs, geometry_msgs, nav_msgs, std_msgs`
-- `puppet_arm_publish_*` 依赖 (见 `agx_robot/follow_control/`)
+### 真机 (AgileX, ROS Noetic = ROS1)
+
+代码层面 `inference_agilex.py` 已经是纯 ROS1 (`rospy`/`cv_bridge`/`sensor_msgs`)，
+但要让 `torch` 和 `rospy` 在**同一个 Python 解释器**里能 import 是真机部署的最大坑：
+
+1. **方案 A — 复用 aloha conda env (Python 3.8)**（推荐）
+
+   ```bash
+   conda env create -f agx_robot/aloha.yml      # 已包含 rospy, cv_bridge, torch
+   conda activate aloha
+   pip install timm tqdm h5py                    # NemoDiT 额外依赖
+   source /opt/ros/noetic/setup.bash             # 引入系统 ROS 路径
+   source ~/catkin_ws/devel/setup.bash           # 你的 puppet_arm 工作空间
+   ```
+
+2. **方案 B — 独立 conda env (Python 3.9+, 想用更新的 torch)**
+
+   `cv_bridge` 默认链接 Python 3.8，conda 3.9+ 直接 import 会失败。两种修法：
+   ```bash
+   # B1: 在 conda env 里 pip 重装与 ROS Python 版本无关的纯 Python cv_bridge
+   pip install cv_bridge3                        # 第三方包，纯 Python，仅 RGB/depth 够用
+   # B2: 在 conda env 里从源码编译 cv_bridge
+   git clone https://github.com/ros-perception/vision_opencv.git
+   cd vision_opencv/cv_bridge && pip install -e .
+   ```
+
+3. **常见检查命令**
+   ```bash
+   python -c "import rospy; print(rospy.__file__)"   # 应当指向 /opt/ros/noetic/...
+   python -c "from cv_bridge import CvBridge"
+   python -c "import torch; print(torch.cuda.is_available())"
+   rostopic list | grep -E '(camera|puppet)'         # 确认采集端在发数据
+   ```
+
+4. **额外 ROS 依赖**
+   - `puppet_arm_publish_*` 节点 (见 `agx_robot/follow_control/`)
+   - RealSense 驱动 (`/camera_f /camera_l /camera_r/color/image_raw`)
+   - Master / puppet 主从映射节点（采集时用的同一套）
 
 ## 5. 常见坑
 
