@@ -412,6 +412,7 @@ class AgileXRosBridge:
         target_right: np.ndarray,
         step_size: float = 0.01,
         rate_hz: int = 200,
+        wait_timeout: float = 10.0,
     ) -> None:
         """Slowly move both master arms from their current position to a target pose.
 
@@ -419,12 +420,38 @@ class AgileXRosBridge:
         each tick advances every joint by at most ``step_size`` toward the
         target until all joints have arrived. Prevents the slave from snapping
         when the policy's first prediction is far from the current pose.
+
+        Args:
+            target_left, target_right: 7-D home poses for left / right arm.
+            step_size: Max per-tick joint delta (rad).
+            rate_hz: Tick rate during the ramp.
+            wait_timeout: Seconds to wait for the first /puppet/joint_* message
+                before aborting with a clear error.
         """
         # Wait for at least one observation from each arm so we know where we are.
         rate = rospy.Rate(rate_hz)
+        start = rospy.Time.now()
+        last_print = start
+        print("[AgileX] Waiting for first /puppet/joint_left and /puppet/joint_right messages...")
         while (not rospy.is_shutdown()) and (
             not self.puppet_arm_left_deque or not self.puppet_arm_right_deque
         ):
+            now = rospy.Time.now()
+            elapsed = (now - start).to_sec()
+            if elapsed > wait_timeout:
+                raise RuntimeError(
+                    f"[AgileX] Timed out after {wait_timeout:.1f}s waiting for "
+                    f"/puppet/joint_left or /puppet/joint_right. "
+                    f"left_msgs={len(self.puppet_arm_left_deque)} "
+                    f"right_msgs={len(self.puppet_arm_right_deque)}. "
+                    f"Is the puppet arm driver running? Try: "
+                    f"`rostopic hz /puppet/joint_left` in another terminal."
+                )
+            if (now - last_print).to_sec() >= 1.0:
+                print(f"  ...still waiting ({elapsed:.1f}s)  "
+                      f"left={len(self.puppet_arm_left_deque)} "
+                      f"right={len(self.puppet_arm_right_deque)}")
+                last_print = now
             rate.sleep()
         if rospy.is_shutdown():
             return
@@ -433,6 +460,10 @@ class AgileXRosBridge:
         right_cur = np.asarray(self.puppet_arm_right_deque[-1].position, dtype=np.float32)
         target_left = np.asarray(target_left, dtype=np.float32)
         target_right = np.asarray(target_right, dtype=np.float32)
+        print(f"[AgileX] Soft-start starting from "
+              f"L={left_cur.round(3).tolist()}  R={right_cur.round(3).tolist()}")
+        print(f"[AgileX] Target home pose       "
+              f"L={target_left.round(3).tolist()}  R={target_right.round(3).tolist()}")
 
         while not rospy.is_shutdown():
             left_diff = target_left - left_cur
