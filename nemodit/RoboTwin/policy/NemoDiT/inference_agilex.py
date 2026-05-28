@@ -570,25 +570,47 @@ def run_inference(args: argparse.Namespace) -> None:
     }
 
     def _inference_worker():
-        while not rospy.is_shutdown() and not state["shutdown"]:
-            with inference_lock:
-                wants = state["wants_replan"]
-            if not wants:
-                rospy.sleep(0.001)
-                continue
-            frame = bridge.get_frame()
-            if frame is None:
-                rospy.sleep(0.005)
-                continue
-            images_bgr, qpos = frame
-            # First call also seeds the n_obs_steps deque.
-            with torch.inference_mode():
-                policy.update_obs(images_bgr, qpos)
-                chunk = policy.predict()  # (n_action_steps, action_dim)
-            with inference_lock:
-                policy.action_queue = [chunk[i] for i in range(chunk.shape[0])]
-                state["ready"] = True
-                state["wants_replan"] = False
+        chunk_count = 0
+        try:
+            while not rospy.is_shutdown() and not state["shutdown"]:
+                with inference_lock:
+                    wants = state["wants_replan"]
+                if not wants:
+                    rospy.sleep(0.001)
+                    continue
+                frame = bridge.get_frame()
+                if frame is None:
+                    rospy.sleep(0.005)
+                    continue
+                images_bgr, qpos = frame
+                # First call also seeds the n_obs_steps deque.
+                t0 = rospy.Time.now()
+                with torch.inference_mode():
+                    policy.update_obs(images_bgr, qpos)
+                    chunk = policy.predict()  # (n_action_steps, action_dim)
+                dt_ms = (rospy.Time.now() - t0).to_sec() * 1000.0
+                with inference_lock:
+                    policy.action_queue = [chunk[i] for i in range(chunk.shape[0])]
+                    state["ready"] = True
+                    state["wants_replan"] = False
+                chunk_count += 1
+                if args.verbose or chunk_count <= 3 or chunk_count % 20 == 0:
+                    pred0 = chunk[0]
+                    diff = pred0 - qpos
+                    print(f"[infer #{chunk_count}] {dt_ms:6.1f}ms  "
+                          f"qpos_now={qpos.round(3).tolist()}\n"
+                          f"           pred[0]={pred0.round(3).tolist()}\n"
+                          f"           diff   ={diff.round(3).tolist()}  "
+                          f"(max |Δ| = {np.abs(diff).max():.4f})")
+        except Exception as exc:
+            # Make sure exceptions in this thread are visible -- by default
+            # uncaught exceptions in threads only print to stderr at process
+            # exit, which can hide the real cause of "nothing moves" issues.
+            import traceback
+            print("[infer ERROR] worker thread crashed:")
+            traceback.print_exc()
+            state["shutdown"] = True
+            raise
 
     inference_thread = threading.Thread(target=_inference_worker, daemon=True)
     inference_thread.start()
@@ -597,6 +619,8 @@ def run_inference(args: argparse.Namespace) -> None:
     rate = rospy.Rate(args.publish_rate)
     print(f"[AgileX] Publishing at {args.publish_rate} Hz (Ctrl+C to stop)...")
     last_action: Optional[np.ndarray] = None
+    publish_tick = 0
+    waiting_ticks = 0
     try:
         while not rospy.is_shutdown():
             if args.max_steps is not None and args.max_steps <= 0:
@@ -620,12 +644,23 @@ def run_inference(args: argparse.Namespace) -> None:
                 action = last_action
             else:
                 # No prediction yet at all — wait.
+                waiting_ticks += 1
+                if waiting_ticks % args.publish_rate == 0:
+                    print(f"[publish] waiting for first prediction ... "
+                          f"({waiting_ticks / args.publish_rate:.1f}s)  "
+                          f"state.ready={state['ready']}  "
+                          f"thread_alive={inference_thread.is_alive()}")
                 rate.sleep()
                 continue
 
             bridge.publish_arms(action[:7], action[7:14])
             if policy.use_robot_base and action.shape[0] >= 16:
                 bridge.publish_base(action[14], action[15])
+
+            publish_tick += 1
+            if args.verbose or publish_tick <= 3 or publish_tick % (args.publish_rate * 2) == 0:
+                print(f"[publish #{publish_tick:5d}] "
+                      f"L={action[:7].round(3).tolist()}  R={action[7:14].round(3).tolist()}")
 
             if args.max_steps is not None:
                 args.max_steps -= 1
@@ -657,6 +692,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--publish_rate", type=int, default=40)
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Optional cap on total publish ticks (for scripted tests)")
+    parser.add_argument("--verbose", "-v", action="store_true", default=False,
+                        help="Print every inference + publish event (very chatty).")
 
     # Soft-start (ramp master to a home pose before policy takes over).
     parser.add_argument("--no_soft_start", action="store_true", default=False,
