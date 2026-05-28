@@ -53,9 +53,12 @@ import torch
 
 # ROS imports are kept optional so the file can be imported on a workstation
 # without a ROS install (e.g. just for static analysis / tests).
+# NOTE: we deliberately do NOT use cv_bridge.imgmsg_to_cv2 because its
+# cv_bridge.boost.cv_bridge_boost C++ extension transitively pulls libgdal +
+# libtiff and breaks on many Ubuntu installs (undefined symbol
+# TIFFReadRGBATileExt). For raw color frames we just np.frombuffer the bytes.
 try:  # pragma: no cover - only available on the robot PC
     import rospy
-    from cv_bridge import CvBridge
     from geometry_msgs.msg import Twist
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import Image, JointState
@@ -267,6 +270,37 @@ class AgileXPolicy:
 # ------------------------------------------------------------------ #
 
 
+def _ros_image_to_numpy(msg) -> np.ndarray:
+    """Convert sensor_msgs/Image to a HxWxC numpy array without cv_bridge.
+
+    Handles the encodings produced by RealSense color streams (``bgr8``,
+    ``rgb8``) and the common AgileX collect_data passthrough case. Returns a
+    writable copy so the downstream preprocessing pipeline can mutate it.
+    """
+    encoding = (msg.encoding or "").lower()
+    raw = msg.data
+    height, width = msg.height, msg.width
+
+    if encoding in ("bgr8", "rgb8"):
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+        return arr.copy()
+    if encoding in ("bgra8", "rgba8"):
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 4))
+        return arr[..., :3].copy()
+    if encoding in ("mono8", "8uc1"):
+        return np.frombuffer(raw, dtype=np.uint8).reshape((height, width)).copy()
+    if encoding in ("mono16", "16uc1"):
+        return np.frombuffer(raw, dtype=np.uint16).reshape((height, width)).copy()
+
+    # Generic fallback: infer channel count from `step` (bytes per row).
+    step = getattr(msg, "step", 0)
+    channels = max(1, step // max(1, width)) if step else 3
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    if channels == 1:
+        return arr.reshape((height, width)).copy()
+    return arr.reshape((height, width, channels)).copy()
+
+
 class AgileXRosBridge:
     """Subscribe / publish wrapper (same topics as agx_robot ACT inference)."""
 
@@ -277,7 +311,7 @@ class AgileXRosBridge:
                 "the AgileX machine inside a ROS environment."
             )
         self.args = args
-        self.bridge = CvBridge()
+        # No CvBridge — see module docstring; we decode raw bytes ourselves.
 
         self.img_front_deque: Deque = deque(maxlen=2000)
         self.img_left_deque: Deque = deque(maxlen=2000)
@@ -360,9 +394,9 @@ class AgileXRosBridge:
                 deque_.popleft()
             return deque_.popleft()
 
-        img_front = self.bridge.imgmsg_to_cv2(_drain(self.img_front_deque), "passthrough")
-        img_left = self.bridge.imgmsg_to_cv2(_drain(self.img_left_deque), "passthrough")
-        img_right = self.bridge.imgmsg_to_cv2(_drain(self.img_right_deque), "passthrough")
+        img_front = _ros_image_to_numpy(_drain(self.img_front_deque))
+        img_left = _ros_image_to_numpy(_drain(self.img_left_deque))
+        img_right = _ros_image_to_numpy(_drain(self.img_right_deque))
         pup_left = _drain(self.puppet_arm_left_deque)
         pup_right = _drain(self.puppet_arm_right_deque)
 
