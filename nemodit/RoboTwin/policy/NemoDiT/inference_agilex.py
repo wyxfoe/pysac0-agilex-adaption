@@ -357,6 +357,44 @@ class AgileXRosBridge:
     def _puppet_right_cb(self, msg): self.puppet_arm_right_deque.append(msg)
     def _robot_base_cb(self, msg): self.robot_base_deque.append(msg)
 
+    # ---- Diagnostics ----
+    def topic_status(self) -> Dict[str, int]:
+        """Return per-topic message counts in the buffers (for debugging)."""
+        return {
+            "img_front": len(self.img_front_deque),
+            "img_left": len(self.img_left_deque),
+            "img_right": len(self.img_right_deque),
+            "puppet_left": len(self.puppet_arm_left_deque),
+            "puppet_right": len(self.puppet_arm_right_deque),
+            "robot_base": len(self.robot_base_deque),
+        }
+
+    def frame_diagnose(self) -> str:
+        """Describe why get_frame() would currently fail (for waiting state)."""
+        s = self.topic_status()
+        empty = [k for k, v in s.items() if v == 0
+                 and (k != "robot_base" or self.args.use_robot_base)]
+        if empty:
+            return f"empty deques: {empty}"
+        # All non-empty: check stamp sync.
+        try:
+            frame_time = min(
+                self.img_front_deque[-1].header.stamp.to_sec(),
+                self.img_left_deque[-1].header.stamp.to_sec(),
+                self.img_right_deque[-1].header.stamp.to_sec(),
+            )
+        except Exception as exc:
+            return f"could not compute frame_time: {exc}"
+        lag = {}
+        for k, dq in (("img_front", self.img_front_deque),
+                      ("img_left", self.img_left_deque),
+                      ("img_right", self.img_right_deque),
+                      ("puppet_left", self.puppet_arm_left_deque),
+                      ("puppet_right", self.puppet_arm_right_deque)):
+            if dq:
+                lag[k] = round(dq[-1].header.stamp.to_sec() - frame_time, 3)
+        return f"all topics have data; latest-stamp vs frame_time={lag}"
+
     # ---- Sync ----
     def get_frame(self) -> Optional[Tuple[List[np.ndarray], np.ndarray]]:
         """Return (images_bgr, qpos) for the most recent synchronized timestep.
@@ -539,6 +577,21 @@ def run_inference(args: argparse.Namespace) -> None:
     )
     bridge = AgileXRosBridge(args)
 
+    # Print the topics we're touching so it's obvious if a default is wrong.
+    print("[AgileX] Subscribed topics:")
+    print(f"   front cam : {args.img_front_topic}")
+    print(f"   left  cam : {args.img_left_topic}")
+    print(f"   right cam : {args.img_right_topic}")
+    print(f"   puppet L  : {args.puppet_arm_left_topic}")
+    print(f"   puppet R  : {args.puppet_arm_right_topic}")
+    if args.use_robot_base:
+        print(f"   base odom : {args.robot_base_topic}")
+    print("[AgileX] Publishing topics:")
+    print(f"   master L  : {args.puppet_arm_left_cmd_topic}")
+    print(f"   master R  : {args.puppet_arm_right_cmd_topic}")
+    if args.use_robot_base:
+        print(f"   cmd_vel   : {args.robot_base_cmd_topic}")
+
     # 1. Soft-start: ramp master to a home pose so the first policy prediction
     #    can't yank the slave across joint space. Defaults match ACT inference's
     #    `left0 / right0` constants; users can override via CLI.
@@ -571,6 +624,9 @@ def run_inference(args: argparse.Namespace) -> None:
 
     def _inference_worker():
         chunk_count = 0
+        none_count = 0
+        last_status_print = rospy.Time.now()
+        first_frame_seen = False
         try:
             while not rospy.is_shutdown() and not state["shutdown"]:
                 with inference_lock:
@@ -580,9 +636,20 @@ def run_inference(args: argparse.Namespace) -> None:
                     continue
                 frame = bridge.get_frame()
                 if frame is None:
+                    none_count += 1
+                    now = rospy.Time.now()
+                    if (now - last_status_print).to_sec() >= 1.0:
+                        print(f"[infer] no synced frame yet (try #{none_count})  "
+                              f"-> {bridge.frame_diagnose()}")
+                        last_status_print = now
                     rospy.sleep(0.005)
                     continue
                 images_bgr, qpos = frame
+                if not first_frame_seen:
+                    first_frame_seen = True
+                    shapes = [im.shape for im in images_bgr]
+                    print(f"[infer] first synced frame OK: image shapes={shapes}  "
+                          f"qpos[14]={qpos.round(3).tolist()}")
                 # First call also seeds the n_obs_steps deque.
                 t0 = rospy.Time.now()
                 with torch.inference_mode():
