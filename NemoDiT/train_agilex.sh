@@ -30,7 +30,7 @@ model_type="DiT-B"
 vision_backbone="resnet50"
 adapter_type="mlp"
 
-n_obs_steps=2
+n_obs_steps=3
 n_action_steps=4
 future_action_window=10
 temporal_agg="concat"

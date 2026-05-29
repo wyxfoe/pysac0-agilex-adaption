@@ -71,8 +71,10 @@ def parse_args() -> argparse.Namespace:
                              "predicts (future_action_window - 1) frames; default 10 -> 9 predicted "
                              "(~300ms horizon @ 30Hz capture rate).")
     parser.add_argument("--past_action_window", type=int, default=0)
-    parser.add_argument("--n_obs_steps", type=int, default=2,
-                        help="Number of past frames fed to the vision encoder")
+    parser.add_argument("--n_obs_steps", type=int, default=3,
+                        help="Number of past frames fed to the vision encoder. Default 3 "
+                             "gives ~67ms temporal window @ 30Hz capture, which helps the "
+                             "encoder pick up motion / velocity cues vs a single frame.")
     parser.add_argument("--n_action_steps", type=int, default=4,
                         help="Number of predicted steps to execute per inference (receding horizon). "
                              "Default 4 -> re-plan every 4/publish_rate seconds (133ms @ 30Hz).")

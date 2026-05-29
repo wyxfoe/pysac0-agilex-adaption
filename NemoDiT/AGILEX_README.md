@@ -99,7 +99,7 @@ bash train_agilex.sh pick_place 50 0 0 ~/data
 |------|------|------|
 | `--num_cameras` | 相机数 (最多 3) | `3` |
 | `--future_action_window` | state+预测总帧数；实际预测 `window-1` 帧 | **`10`** (= 9 预测帧 ≈ 300ms @ 30Hz) |
-| `--n_obs_steps` | 视觉历史帧数 | `2` |
+| `--n_obs_steps` | 视觉历史帧数 | **`3`** (≈67ms @ 30Hz 时间窗) |
 | `--n_action_steps` | 推理时一次执行的帧数 (receding horizon) | **`4`** (闭环重规划 7.5Hz @ 30Hz) |
 | `--temporal_agg` | 多帧特征聚合 (`last/mean/concat`) | `concat` |
 | `--use_robot_base` | 把 `/base_action` 拼接到 qpos/action | `False` |
