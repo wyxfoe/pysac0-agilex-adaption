@@ -66,14 +66,16 @@ def parse_args() -> argparse.Namespace:
                         help="Run validation every N epochs (only when --val_ratio > 0).")
 
     # Temporal windows
-    parser.add_argument("--future_action_window", type=int, default=13,
+    parser.add_argument("--future_action_window", type=int, default=10,
                         help="Total action window (= state slot + predicted frames). The model "
-                             "predicts (future_action_window - 1) frames; default 13 -> 12 predicted.")
+                             "predicts (future_action_window - 1) frames; default 10 -> 9 predicted "
+                             "(~300ms horizon @ 30Hz capture rate).")
     parser.add_argument("--past_action_window", type=int, default=0)
     parser.add_argument("--n_obs_steps", type=int, default=2,
                         help="Number of past frames fed to the vision encoder")
-    parser.add_argument("--n_action_steps", type=int, default=8,
-                        help="Number of predicted steps to execute per inference (receding horizon)")
+    parser.add_argument("--n_action_steps", type=int, default=4,
+                        help="Number of predicted steps to execute per inference (receding horizon). "
+                             "Default 4 -> re-plan every 4/publish_rate seconds (133ms @ 30Hz).")
     parser.add_argument("--temporal_agg", type=str, default="concat",
                         choices=["last", "mean", "concat"])
 
@@ -81,8 +83,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_type", type=str, default="DiT-B",
                         choices=["DiT-S", "DiT-B", "DiT-L", "DiT-XL"])
     parser.add_argument("--token_size", type=int, default=2048)
-    parser.add_argument("--dropout_prob", type=float, default=0.1,
-                        help="Class dropout probability for CFG")
+    parser.add_argument("--dropout_prob", type=float, default=0.0,
+                        help="Class dropout probability for classifier-free guidance. "
+                             "Set to 0 when you don't plan to use --cfg_scale > 1 at inference "
+                             "(default). Set to 0.1 only if you want CFG.")
 
     # Vision
     parser.add_argument("--vision_backbone", type=str, default="resnet50",

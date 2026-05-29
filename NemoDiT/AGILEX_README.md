@@ -98,17 +98,18 @@ bash train_agilex.sh pick_place 50 0 0 ~/data
 | 参数 | 说明 | 默认 |
 |------|------|------|
 | `--num_cameras` | 相机数 (最多 3) | `3` |
-| `--future_action_window` | state+预测总帧数；实际预测 `window-1` 帧 | `13` |
+| `--future_action_window` | state+预测总帧数；实际预测 `window-1` 帧 | **`10`** (= 9 预测帧 ≈ 300ms @ 30Hz) |
 | `--n_obs_steps` | 视觉历史帧数 | `2` |
-| `--n_action_steps` | 推理时一次执行的帧数 (receding horizon) | `8` |
+| `--n_action_steps` | 推理时一次执行的帧数 (receding horizon) | **`4`** (闭环重规划 7.5Hz @ 30Hz) |
 | `--temporal_agg` | 多帧特征聚合 (`last/mean/concat`) | `concat` |
 | `--use_robot_base` | 把 `/base_action` 拼接到 qpos/action | `False` |
 | `--arm_delay_time` | 前移 action 目标帧数 (同 ACT dataloader) | `0` |
 | `--exclude_terminal_padding` | 丢掉 episode 末端需要 padding 的样本 | `False` |
-| `--val_ratio` / `--val_every` | 验证集比例 / 验证频率 | `0.0 / 10` |
+| `--val_ratio` / `--val_every` | 验证集比例 / 验证频率 | `0.1 / 10` |
 | `--use_amp` | AMP fp16 | `False` |
 | `--use_ema` | EMA 权重 | `False` |
-| `--dropout_prob` | CFG 训练时条件丢弃概率（推理 `--cfg_scale > 1` 才生效） | `0.1` |
+| `--dropout_prob` | CFG 训练时条件丢弃概率（推理 `--cfg_scale > 1` 才生效） | **`0.0`** (不用 CFG) |
+| `--num_inference_steps` | Flow Matching ODE 积分步数 | `10` |
 
 > **约束**：`n_obs_steps + n_action_steps <= future_action_window`。
 
@@ -221,6 +222,14 @@ checkpoint 中已嵌入 `args` 与 `norm_stats`，无需额外传递。若仅有
 
 跳过 soft-start：`--no_soft_start`。
 自定义 home pose：`--soft_start_left "0,0,...,0" --soft_start_right "0,0,...,0"`（各 7 维）。
+
+**Obs cache warm-up**：soft-start 完成后，正式推理前会**先收集 `--warmup_obs_frames`
+帧真实观测**（默认 = checkpoint 中的 `n_obs_steps`，即 2 帧）填满 `obs deque`，
+避免第一次 `predict()` 把 "两帧同一图像" 喂进 ResNet（这种输入分布外，模型
+没在训练时见过）。等价于"丢弃第一个 chunk 不用"，但**不浪费 GPU 推理**。
+
+- 强制关闭：`--warmup_obs_frames 0`
+- 多收几帧：`--warmup_obs_frames 4`
 
 ### 3.3 数据流细节
 

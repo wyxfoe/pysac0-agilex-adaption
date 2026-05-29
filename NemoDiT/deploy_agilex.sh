@@ -24,7 +24,7 @@
 set -euo pipefail
 
 ckpt=${1:?"checkpoint path required"}
-rate=${2:-40}
+rate=${2:-30}    # default matches cobot_magic/collect_data.py capture rate
 shift 2 || true
 
 # Source ROS env if not already loaded.

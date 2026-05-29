@@ -612,6 +612,33 @@ def run_inference(args: argparse.Namespace) -> None:
             except EOFError:
                 pass
 
+    # 1b. Obs cache warm-up: the very first predict() call would otherwise see
+    #     a duplicated first frame in the n_obs_steps deque (update_obs() fills
+    #     by repetition on the first call). That input is OOD compared to the
+    #     30Hz consecutive frames the model trained on. By collecting
+    #     `warmup_obs_frames` real frames here, the first published prediction
+    #     is made on a fully real temporal window -- effectively the equivalent
+    #     of "discard the first chunk".
+    n_warmup = (args.warmup_obs_frames
+                if args.warmup_obs_frames is not None
+                else policy.n_obs_steps)
+    if n_warmup > 0:
+        print(f"[AgileX] Warming up obs cache: collecting {n_warmup} real frames...")
+        collected = 0
+        warmup_rate = rospy.Rate(args.publish_rate)
+        while collected < n_warmup and not rospy.is_shutdown():
+            frame = bridge.get_frame()
+            if frame is None:
+                rospy.sleep(0.005)
+                continue
+            images_bgr, qpos = frame
+            policy.update_obs(images_bgr, qpos)
+            collected += 1
+            print(f"  obs frame {collected}/{n_warmup} collected  "
+                  f"qpos[14]={qpos.round(3).tolist()}")
+            warmup_rate.sleep()  # pace at publish_rate so frames differ
+        print("[AgileX] Obs cache ready.")
+
     # 2. Threaded inference: model.sample() can take 50-150ms; if we ran it in
     #    the publish loop we'd miss ticks at publish_rate=40Hz. Inference thread
     #    pulls a fresh frame on demand, fills the queue, signals "ready".
@@ -773,6 +800,13 @@ def parse_args() -> argparse.Namespace:
                         help="Max joint delta per tick during soft-start (rad/tick).")
     parser.add_argument("--soft_start_pause", action="store_true", default=False,
                         help="Pause for an Enter keypress after soft-start (like ACT).")
+
+    # Obs cache warm-up
+    parser.add_argument("--warmup_obs_frames", type=int, default=None,
+                        help="Collect N real frames before the first inference so "
+                             "the n_obs_steps deque is fully real (not padded "
+                             "duplicates of the very first frame). Default = "
+                             "checkpoint's n_obs_steps. Set to 0 to disable.")
 
     # ROS topics (defaults mirror agx_robot/aloha-devel/act/inference.py).
     parser.add_argument("--img_front_topic", type=str, default="/camera_f/color/image_raw")

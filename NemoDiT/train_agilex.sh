@@ -31,9 +31,11 @@ vision_backbone="resnet50"
 adapter_type="mlp"
 
 n_obs_steps=2
-n_action_steps=8
-future_action_window=13
+n_action_steps=4
+future_action_window=10
 temporal_agg="concat"
+dropout_prob=0.0             # 0 = no CFG dropout; raise only if you plan to use --cfg_scale > 1
+num_inference_steps=10       # ODE steps embedded into the checkpoint
 
 num_cameras=3                # cam_high, cam_left_wrist, cam_right_wrist
 use_robot_base=""            # set to "--use_robot_base" for mobile base tasks
@@ -52,7 +54,6 @@ weight_decay=0.01
 grad_clip=1.0
 num_workers=4
 save_every=50
-num_inference_steps=10
 
 # ---------------- WandB ----------------
 use_wandb=""                 # set to "--use_wandb" to enable
@@ -92,6 +93,7 @@ python train_agilex.py \
     --n_action_steps "${n_action_steps}" \
     --future_action_window "${future_action_window}" \
     --temporal_agg "${temporal_agg}" \
+    --dropout_prob "${dropout_prob}" \
     --num_inference_steps "${num_inference_steps}" \
     --epochs "${epochs}" \
     --batch_size "${batch_size}" \
