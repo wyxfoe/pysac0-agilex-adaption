@@ -1,20 +1,20 @@
 # NemoDiT 适配松灵 AgileX / Mobile-Aloha 真机
 
-本目录下除了原 RoboTwin 管线之外，新增了针对松灵 AgileX 双臂机器人 (基于
-cobot_magic 采集栈 + `agx_robot` ACT pipeline) 的三个文件：
+本仓库已经裁剪为**仅真机管线** —— 原 RoboTwin 仿真器、`code_gen` / `description` /
+`envs` / `assets` 等仿真侧目录全部移除。剩下的代码全部围绕 cobot_magic 采集栈 +
+`agx_robot` ACT pipeline 设计：
 
 | 文件 | 作用 |
 |------|------|
 | `dataloader_agilex.py` | 读取 `collect_data.py` 保存的扁平 14-D AgileX HDF5 |
 | `train_agilex.py` / `train_agilex.sh` | 在 AgileX 数据上训练 Flow-Matching DiT |
 | `inference_agilex.py` / `deploy_agilex.sh` | ROS1 真机推理 (camera → 模型 → puppet arm cmd) |
+| `inspect_hdf5.py` | HDF5 数据审查工具 |
+| `model/` / `utils/` | DiT 主干 + ResNet/ViT 视觉 backbone + Flow Matching + EMA |
 
-原 `dataloader.py` / `train.py` / `eval.py` / `deploy_policy.py` 仍保留用于
-RoboTwin 仿真。
+## 1. 数据格式
 
-## 1. 数据格式差异
-
-`agx_robot/collect_data/collect_data.py` 保存的数据与 RoboTwin 版不同：
+`agx_robot/collect_data/collect_data.py` 保存的 AgileX HDF5 结构：
 
 ```
 episode_X.hdf5
@@ -62,7 +62,7 @@ episode_X.hdf5
 ### 2.2 直接调用 Python 脚本
 
 ```bash
-cd nemodit/RoboTwin/policy/NemoDiT
+cd NemoDiT
 
 python train_agilex.py \
     --data_path ~/data/pick_place \
