@@ -81,16 +81,45 @@ python train_agilex.py \
     --checkpoint_dir checkpoints/pick_place-50-seed0
 ```
 
-会在 `checkpoints/pick_place-50-seed0/` 下产出：
+会在 `checkpoints/pick_place-50-seed0/` 下产出（Python 直接调用时不带时间戳）：
 
 - `{epoch}.pt` / `final.pt` / `latest.pt` — checkpoint，`args` 和 `norm_stats` 嵌入其中
+- `best.pt` — val_loss 最优的那个版本（若启用了 `--val_ratio > 0`）
 - `dataset_stats.pkl` — 与 ACT 兼容的归一化统计 (qpos_mean/std, action_mean/std)
 
-### 2.3 Shell 脚本
+### 2.3 Shell 脚本（推荐，自动按日期分目录）
 
 ```bash
 bash train_agilex.sh pick_place 50 0 0 ~/data
 # args: <task_name> <expert_data_num> <seed> <gpu_id> [data_root]
+```
+
+Shell 脚本会自动在路径末尾追加启动时间戳，避免相同配置多次训练时互相覆盖：
+
+```
+checkpoints/
+└── pick_place-50-seed0/
+    ├── 2026-05-29_14-30-00/      ← 第一次跑
+    │   ├── best.pt
+    │   ├── latest.pt
+    │   ├── final.pt
+    │   ├── 50.pt 100.pt ...
+    │   └── dataset_stats.pkl
+    ├── 2026-05-29_16-22-15/      ← 第二次跑（改了超参又跑一次）
+    │   └── ...
+    └── 2026-05-30_09-15-30/      ← 第三次跑
+        └── ...
+```
+
+部署时直接指 best.pt 的完整路径：
+```bash
+bash deploy_agilex.sh checkpoints/pick_place-50-seed0/2026-05-29_14-30-00/best.pt
+```
+
+或者用 `ls -t | head -1` 总是抓最新一次：
+```bash
+LATEST=$(ls -td checkpoints/pick_place-50-seed0/*/ | head -1)
+bash deploy_agilex.sh "${LATEST}best.pt"
 ```
 
 ### 2.4 关键超参

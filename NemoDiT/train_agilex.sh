@@ -13,7 +13,10 @@
 # Notes:
 #   - Assumes AgileX/Mobile-Aloha HDF5 layout produced by collect_data.py
 #     (see agx_robot/collect_data/collect_data.py).
-#   - Saves checkpoints + dataset_stats.pkl under checkpoints/<run_name>/.
+#   - Saves checkpoints + dataset_stats.pkl under
+#     checkpoints/<run_name>/<YYYY-MM-DD_HH-MM-SS>/.
+#     The timestamp subfolder prevents successive runs of the same task from
+#     overwriting each other. Symlink or use the latest dir for deployment.
 #   - Default uses 3 wrist+top cameras (cam_high, cam_left_wrist, cam_right_wrist),
 #     joint action, 14-D qpos/action.
 
@@ -62,7 +65,11 @@ wandb_project="nemodit_agilex"
 # ---------------- Paths ----------------
 data_path="${data_root}/${task_name}"
 run_name="${task_name}-${expert_data_num}-seed${seed}"
-checkpoint_dir="checkpoints/${run_name}"
+# Append a timestamp so successive runs of the same task don't overwrite each
+# other. Layout:
+#   checkpoints/<run_name>/<YYYY-MM-DD_HH-MM-SS>/{best,latest,final,...}.pt
+timestamp=$(date +%Y-%m-%d_%H-%M-%S)
+checkpoint_dir="checkpoints/${run_name}/${timestamp}"
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 
