@@ -256,6 +256,34 @@ class AgileXPolicy:
         out_np = out.cpu().numpy()[0]
         return out_np * self.action_std + self.action_mean
 
+    @torch.no_grad()
+    def predict_full(self) -> np.ndarray:
+        """Predict the full ``(future_action_window - 1)`` action chunk without truncation.
+
+        Used by ACT-style temporal ensembling so each chunk can contribute to
+        multiple future publish ticks.
+        """
+        if self._latest_qpos is None or not self._image_cache:
+            raise RuntimeError("update_obs() must be called before predict_full().")
+
+        images = np.stack(list(self._image_cache), axis=0)
+        images = np.expand_dims(images, axis=0)
+        images_t = torch.from_numpy(images).float().to(self.device)
+
+        qpos_norm = (self._latest_qpos - self.qpos_mean) / self.qpos_std
+        state_t = torch.from_numpy(qpos_norm).float().unsqueeze(0).to(self.device)
+
+        out = self.model.sample(
+            images_t,
+            state=state_t,
+            num_steps=self.num_inference_steps,
+            ode_solver=self.ode_solver,
+            cfg_scale=self.cfg_scale,
+            return_all=True,
+        )  # (1, future_action_window - 1, action_dim)
+        out_np = out.cpu().numpy()[0]
+        return out_np * self.action_std + self.action_mean
+
     def get_action(self, images_bgr: List[np.ndarray], qpos: np.ndarray) -> np.ndarray:
         """Return the next action, re-planning when the execution queue is empty."""
         self.update_obs(images_bgr, qpos)
@@ -639,14 +667,27 @@ def run_inference(args: argparse.Namespace) -> None:
             warmup_rate.sleep()  # pace at publish_rate so frames differ
         print("[AgileX] Obs cache ready.")
 
-    # 2. Threaded inference: model.sample() can take 50-150ms; if we ran it in
-    #    the publish loop we'd miss ticks at publish_rate=40Hz. Inference thread
-    #    pulls a fresh frame on demand, fills the queue, signals "ready".
+    # 2. Hand off to the chosen control loop.
+    if args.temporal_ensemble:
+        print(f"[AgileX] Using ACT-style temporal ensembling (k={args.ensemble_k:.4f})")
+        _run_temporal_ensemble(args, policy, bridge)
+    else:
+        print("[AgileX] Using receding-horizon (no ensembling)")
+        _run_receding_horizon(args, policy, bridge)
+
+
+# ------------------------------------------------------------------ #
+# Control loop A: receding horizon (one full chunk per replan)
+# ------------------------------------------------------------------ #
+
+
+def _run_receding_horizon(args, policy: "AgileXPolicy", bridge: "AgileXRosBridge") -> None:
+    """Original control loop: predict an n_action_steps chunk, execute it, replan."""
     inference_lock = threading.Lock()
     state = {
         "shutdown": False,
-        "ready": False,                       # True once at least one prediction is queued
-        "wants_replan": True,                 # True when the queue should be refilled
+        "ready": False,
+        "wants_replan": True,
     }
 
     def _inference_worker():
@@ -677,11 +718,10 @@ def run_inference(args: argparse.Namespace) -> None:
                     shapes = [im.shape for im in images_bgr]
                     print(f"[infer] first synced frame OK: image shapes={shapes}  "
                           f"qpos[14]={qpos.round(3).tolist()}")
-                # First call also seeds the n_obs_steps deque.
                 t0 = rospy.Time.now()
                 with torch.inference_mode():
                     policy.update_obs(images_bgr, qpos)
-                    chunk = policy.predict()  # (n_action_steps, action_dim)
+                    chunk = policy.predict()
                 dt_ms = (rospy.Time.now() - t0).to_sec() * 1000.0
                 with inference_lock:
                     policy.action_queue = [chunk[i] for i in range(chunk.shape[0])]
@@ -696,10 +736,7 @@ def run_inference(args: argparse.Namespace) -> None:
                           f"           pred[0]={pred0.round(3).tolist()}\n"
                           f"           diff   ={diff.round(3).tolist()}  "
                           f"(max |Δ| = {np.abs(diff).max():.4f})")
-        except Exception as exc:
-            # Make sure exceptions in this thread are visible -- by default
-            # uncaught exceptions in threads only print to stderr at process
-            # exit, which can hide the real cause of "nothing moves" issues.
+        except Exception:
             import traceback
             print("[infer ERROR] worker thread crashed:")
             traceback.print_exc()
@@ -709,7 +746,6 @@ def run_inference(args: argparse.Namespace) -> None:
     inference_thread = threading.Thread(target=_inference_worker, daemon=True)
     inference_thread.start()
 
-    # 3. Publish loop at fixed publish_rate; replans when the queue drains.
     rate = rospy.Rate(args.publish_rate)
     print(f"[AgileX] Publishing at {args.publish_rate} Hz (Ctrl+C to stop)...")
     last_action: Optional[np.ndarray] = None
@@ -719,25 +755,17 @@ def run_inference(args: argparse.Namespace) -> None:
         while not rospy.is_shutdown():
             if args.max_steps is not None and args.max_steps <= 0:
                 break
-
             with inference_lock:
-                if not state["ready"]:
-                    queued = []
-                else:
-                    queued = policy.action_queue
-
+                queued = policy.action_queue if state["ready"] else []
             if queued:
                 action = queued.pop(0)
                 with inference_lock:
                     if not policy.action_queue:
-                        state["wants_replan"] = True  # ask worker to fetch next chunk
+                        state["wants_replan"] = True
                 last_action = action
             elif last_action is not None:
-                # Queue is empty and replan in flight: hold the last command so
-                # the master doesn't go limp during the inference gap.
                 action = last_action
             else:
-                # No prediction yet at all — wait.
                 waiting_ticks += 1
                 if waiting_ticks % args.publish_rate == 0:
                     print(f"[publish] waiting for first prediction ... "
@@ -746,21 +774,161 @@ def run_inference(args: argparse.Namespace) -> None:
                           f"thread_alive={inference_thread.is_alive()}")
                 rate.sleep()
                 continue
+            bridge.publish_arms(action[:7], action[7:14])
+            if policy.use_robot_base and action.shape[0] >= 16:
+                bridge.publish_base(action[14], action[15])
+            publish_tick += 1
+            if args.verbose or publish_tick <= 3 or publish_tick % (args.publish_rate * 2) == 0:
+                print(f"[publish #{publish_tick:5d}] "
+                      f"L={action[:7].round(3).tolist()}  R={action[7:14].round(3).tolist()}")
+            if args.max_steps is not None:
+                args.max_steps -= 1
+            rate.sleep()
+    finally:
+        state["shutdown"] = True
+        inference_thread.join(timeout=2.0)
+        print("[AgileX] Inference stopped.")
+
+
+# ------------------------------------------------------------------ #
+# Control loop B: ACT-style temporal ensembling
+# ------------------------------------------------------------------ #
+
+
+def _run_temporal_ensemble(args, policy: "AgileXPolicy", bridge: "AgileXRosBridge") -> None:
+    """Replicate ACT's temporal ensembling at publish_rate.
+
+    Every prediction returns the **full** ``(future_action_window - 1)`` action
+    chunk. Each frame in that chunk is tagged with the publish tick the
+    prediction was made at. At publish tick ``t``, we gather every chunk slot
+    that lands on ``t`` (chunks predicted up to ``chunk_size`` ticks ago) and
+    average them with exponentially decaying weights ``exp(-k * age)`` where
+    ``age = t - t_pred``. Smaller ``k`` weights older predictions more; ACT's
+    paper uses ``k = 0.01`` as the default.
+
+    The inference worker runs back-to-back without ``wants_replan`` gating so
+    we get fresh predictions as fast as the GPU allows.
+    """
+    chunk_size = policy.model.future_action_window_size - 1   # number of predicted frames
+    inference_lock = threading.Lock()
+    publish_tick = 0   # incremented by the publish thread, read by both
+    chunks_buffer: Deque[Tuple[int, np.ndarray]] = deque(maxlen=chunk_size + 8)
+    state = {
+        "shutdown": False,
+        "ready": False,
+    }
+
+    def _ensemble_worker():
+        chunk_count = 0
+        none_count = 0
+        last_status_print = rospy.Time.now()
+        first_frame_seen = False
+        try:
+            while not rospy.is_shutdown() and not state["shutdown"]:
+                frame = bridge.get_frame()
+                if frame is None:
+                    none_count += 1
+                    now = rospy.Time.now()
+                    if (now - last_status_print).to_sec() >= 1.0:
+                        print(f"[infer] no synced frame yet (try #{none_count})  "
+                              f"-> {bridge.frame_diagnose()}")
+                        last_status_print = now
+                    rospy.sleep(0.005)
+                    continue
+                images_bgr, qpos = frame
+                if not first_frame_seen:
+                    first_frame_seen = True
+                    shapes = [im.shape for im in images_bgr]
+                    print(f"[infer] first synced frame OK: image shapes={shapes}  "
+                          f"qpos[14]={qpos.round(3).tolist()}")
+                t0 = rospy.Time.now()
+                with torch.inference_mode():
+                    policy.update_obs(images_bgr, qpos)
+                    full_chunk = policy.predict_full()  # (chunk_size, action_dim)
+                dt_ms = (rospy.Time.now() - t0).to_sec() * 1000.0
+                with inference_lock:
+                    t_pred = publish_tick
+                    chunks_buffer.append((t_pred, full_chunk))
+                    state["ready"] = True
+                chunk_count += 1
+                if args.verbose or chunk_count <= 3 or chunk_count % 20 == 0:
+                    pred0 = full_chunk[0]
+                    diff = pred0 - qpos
+                    print(f"[infer #{chunk_count}] {dt_ms:6.1f}ms  t_pred={t_pred}  "
+                          f"chunk_size={chunk_size}\n"
+                          f"           pred[0]={pred0.round(3).tolist()}\n"
+                          f"           diff vs qpos = {diff.round(3).tolist()}  "
+                          f"(max |Δ| = {np.abs(diff).max():.4f})")
+        except Exception:
+            import traceback
+            print("[infer ERROR] ensemble worker crashed:")
+            traceback.print_exc()
+            state["shutdown"] = True
+            raise
+
+    inference_thread = threading.Thread(target=_ensemble_worker, daemon=True)
+    inference_thread.start()
+
+    rate = rospy.Rate(args.publish_rate)
+    print(f"[AgileX] Publishing at {args.publish_rate} Hz with temporal ensembling "
+          f"(chunk_size={chunk_size}, k={args.ensemble_k}) (Ctrl+C to stop)...")
+    last_action: Optional[np.ndarray] = None
+    waiting_ticks = 0
+    try:
+        while not rospy.is_shutdown():
+            if args.max_steps is not None and args.max_steps <= 0:
+                break
+
+            # Snapshot the buffer + tick under the lock.
+            with inference_lock:
+                t_now = publish_tick
+                snapshot = list(chunks_buffer)
+                ready = state["ready"]
+
+            contributors: List[np.ndarray] = []
+            ages: List[int] = []
+            for t_pred, chunk in snapshot:
+                offset = t_now - t_pred
+                if 0 <= offset < chunk_size:
+                    contributors.append(chunk[offset])
+                    ages.append(offset)
+
+            if contributors:
+                actions_arr = np.stack(contributors, axis=0)
+                age_arr = np.asarray(ages, dtype=np.float32)
+                weights = np.exp(-args.ensemble_k * age_arr)
+                weights = weights / weights.sum()
+                action = (actions_arr * weights[:, None]).sum(axis=0)
+                last_action = action
+            elif last_action is not None:
+                action = last_action
+            else:
+                waiting_ticks += 1
+                if waiting_ticks % args.publish_rate == 0:
+                    print(f"[publish] waiting for first prediction ... "
+                          f"({waiting_ticks / args.publish_rate:.1f}s)  "
+                          f"state.ready={ready}  "
+                          f"thread_alive={inference_thread.is_alive()}  "
+                          f"buffer_size={len(snapshot)}")
+                rate.sleep()
+                continue
 
             bridge.publish_arms(action[:7], action[7:14])
             if policy.use_robot_base and action.shape[0] >= 16:
                 bridge.publish_base(action[14], action[15])
 
-            publish_tick += 1
-            if args.verbose or publish_tick <= 3 or publish_tick % (args.publish_rate * 2) == 0:
-                print(f"[publish #{publish_tick:5d}] "
+            with inference_lock:
+                publish_tick += 1
+                tick_now = publish_tick
+
+            if args.verbose or tick_now <= 3 or tick_now % (args.publish_rate * 2) == 0:
+                print(f"[publish #{tick_now:5d}] ensemble of {len(contributors)} chunks  "
                       f"L={action[:7].round(3).tolist()}  R={action[7:14].round(3).tolist()}")
 
             if args.max_steps is not None:
                 args.max_steps -= 1
             rate.sleep()
     finally:
-        # Graceful shutdown: stop the inference thread.
         state["shutdown"] = True
         inference_thread.join(timeout=2.0)
         print("[AgileX] Inference stopped.")
@@ -807,6 +975,19 @@ def parse_args() -> argparse.Namespace:
                              "the n_obs_steps deque is fully real (not padded "
                              "duplicates of the very first frame). Default = "
                              "checkpoint's n_obs_steps. Set to 0 to disable.")
+
+    # Temporal ensembling (ACT-style)
+    parser.add_argument("--temporal_ensemble", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="ACT-style temporal ensembling: every publish tick "
+                             "averages predictions from multiple recent chunks with "
+                             "exp-decay weights, smoothing trajectories and reducing "
+                             "single-prediction noise. Use --no-temporal_ensemble to "
+                             "fall back to plain receding-horizon execution.")
+    parser.add_argument("--ensemble_k", type=float, default=0.01,
+                        help="Decay constant for ACT temporal ensembling weights "
+                             "exp(-k * age_in_ticks). Lower k = trust older predictions "
+                             "more; ACT's default is 0.01.")
 
     # ROS topics (defaults mirror agx_robot/aloha-devel/act/inference.py).
     parser.add_argument("--img_front_topic", type=str, default="/camera_f/color/image_raw")

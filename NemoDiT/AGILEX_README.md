@@ -256,15 +256,57 @@ python inference_agilex.py --checkpoint final.pt --cfg_scale 1.5
 `cfg_scale=1.0`（默认）等价于无 guidance，相当于训练时的 dropout 白浪费。
 真机上可以从 `1.0 → 1.3 → 1.5` 渐增观察控制是否更稳。
 
-### 3.3 与 ACT 推理的差异
+### 3.3 ACT-style Temporal Ensembling（默认启用）
+
+`inference_agilex.py` 现在**默认开启** ACT 风格的 temporal ensembling：每次预测
+返回完整的 `future_action_window - 1` 帧 chunk，推理线程**连续重新预测**（不等
+队列空），每个时刻 `t` 的输出是**所有还在有效期内的 chunk 对该时刻预测的指数加权
+平均**。
+
+数学：
+```
+chunk_i predicted at tick t_pred_i covers [t_pred_i, t_pred_i + chunk_size)
+For publish tick t:
+    contributors = [chunk_i[t - t_pred_i] for i where 0 <= t - t_pred_i < chunk_size]
+    weights = exp(-k * (t - t_pred_i)) for each contributor
+    weights /= sum(weights)
+    action_t = sum(weights * contributors)
+```
+
+`k` 越小，旧预测权重越大；ACT 论文默认 `k=0.01`。
+
+| CLI flag | 默认 | 说明 |
+|---|---|---|
+| `--temporal_ensemble` / `--no-temporal_ensemble` | True | 启用 / 关闭 |
+| `--ensemble_k` | 0.01 | 衰减系数 |
+
+### 3.4 与 ACT 推理的差异
 
 | 项 | ACT inference.py | inference_agilex.py |
 |----|------------------|---------------------|
 | 观测帧 | 单帧 | `n_obs_steps` 多帧 (deque) |
 | 条件 | qpos + images | qpos (state token) + images (vision token) |
-| 策略 | Transformer 预测整段 chunk | Flow-Matching DiT ODE 采样 |
-| temporal_agg | 指数加权 (all_time_actions) | receding horizon (执行队列) |
-| 动作插值 | 可选 `--use_actions_interpolation` | 由 DiT 本身保证轨迹连贯 |
+| 策略 | Transformer 一次出整段 chunk | Flow-Matching DiT ODE 采样 |
+| Temporal ensembling | 内置且默认开 (`temporal_agg=True`) | **同样内置且默认开**（v2 起） |
+| 动作插值 | 可选 `--use_actions_interpolation` | 由 ensembling + DiT 本身保证连贯 |
+| 推理频率 | 每 tick 都推理 | 每 tick 都推理（与 ACT 一致） |
+
+若想退回到旧的单 chunk receding-horizon 行为对比效果：
+```bash
+bash deploy_agilex.sh checkpoints/.../best.pt 30 --no-temporal_ensemble
+```
+
+### 3.5 GPU 时间预算
+
+| 模式 | 推理频率 | GPU 负载 (DiT-S 50ms/次) |
+|---|---|---|
+| Receding horizon (n_action_steps=4) | 7.5 Hz | ~37% |
+| **Temporal ensemble** | **30 Hz** | **~150%** ⚠️ |
+
+如果 GPU 撑不住（看 `[infer #N] dt_ms` > 33ms），可以：
+- 把 `--num_inference_steps` 降到 5-7
+- 用 `--ode_solver euler`（一阶，更快但略糙）
+- 或回退 `--no-temporal_ensemble`
 
 若需要软着陆启动 / 安全姿态序列，可复用 ACT inference 中的
 `puppet_arm_publish_continuous` / `puppet_arm_publish_linear` 逻辑放在
